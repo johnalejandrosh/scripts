@@ -18,7 +18,7 @@ if ! aws sts get-caller-identity &>/dev/null; then
   echo "      cp /mnt/c/Users/TuUsuario/.aws/credentials ~/.aws/credentials"
   echo "      cp /mnt/c/Users/TuUsuario/.aws/config ~/.aws/config"
   echo ""
-  exit 1
+  exit 1  
 fi
 
 echo "✅ Credenciales verificadas correctamente"
