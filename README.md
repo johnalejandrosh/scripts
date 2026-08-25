@@ -1,15 +1,25 @@
 # scriptstui
 
-TUI (estilo lazygit) para levantar y detener los túneles SSM de AWS que antes
-vivían como scripts `.sh` sueltos. Reemplaza a los scripts en [legacy-sh/](legacy-sh/)
-(que se dejaron ahí solo de referencia, no se usan).
+Herramienta para levantar y detener los túneles SSM de AWS que antes vivían
+como scripts `.sh` sueltos, y para manejar las cuentas AWS SSO que los
+autentican. Reemplaza a los scripts en [legacy-sh/](legacy-sh/) (que se
+dejaron ahí solo de referencia, no se usan).
+
+Tiene **dos interfaces**, ambas sobre la misma lógica en `internal/`
+(ningún dato ni comportamiento vive solo en una de las dos):
+
+- **TUI** (`main.go`, estilo lazygit) — la interfaz **principal**. Es la que
+  se documenta abajo y la que se usa día a día.
+- **App de escritorio** ([desktop/](desktop/), Wails) — vista con ventana
+  nativa para quien prefiera no usar la terminal. Ver
+  [desktop/README.md](desktop/README.md).
 
 ## Requisitos
 
 - Go 1.26+
 - AWS CLI v2 instalado y en el `PATH` (`aws --version`)
 
-## Compilar y ejecutar
+## Compilar y ejecutar (TUI)
 
 ```sh
 go build -o scriptstui .
@@ -128,11 +138,23 @@ hace falta indicar ningún perfil ahí — se asigna desde la TUI con `p`.
 ## Estructura
 
 ```
-main.go                      arranca la TUI
+main.go                      arranca la TUI (interfaz principal)
 internal/config/             definición de los túneles (sin credenciales)
 internal/procman/            arranca/detiene los procesos, streamea logs
 internal/awscreds/           parseo/validación de credenciales pegadas
 internal/ssologin/           descubre perfiles, login/logout y alta de cuentas SSO
-internal/tui/                interfaz (bubbletea + lipgloss)
+internal/tui/                interfaz de terminal (bubbletea + lipgloss)
+desktop/                     app de escritorio (Wails) — mismo internal/, otra cara
 legacy-sh/                    scripts .sh originales, solo de referencia
 ```
+
+## App de escritorio
+
+Vive en [desktop/](desktop/) como un subpaquete de este mismo módulo Go (no
+tiene su propio `go.mod`, por eso puede importar `internal/...` tal cual) con
+un frontend propio en `desktop/frontend/`. Detalles de uso y desarrollo en
+[desktop/README.md](desktop/README.md).
+
+La TUI sigue siendo la interfaz de referencia: se documenta primero, se
+prueba primero, y cualquier funcionalidad nueva en `internal/` queda
+disponible en el escritorio casi gratis porque comparten el mismo backend.

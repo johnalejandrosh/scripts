@@ -16,17 +16,25 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// DeviceCodePattern matches the "XXXX-XXXX" device code `aws sso login`
+// prints on its own line, e.g. to splice it onto the verification URL
+// printed just above into one pasteable link.
+var DeviceCodePattern = regexp.MustCompile(`^[A-Z0-9]{4}-[A-Z0-9]{4}$`)
 
 // Profile is one SSO-enabled profile found in ~/.aws/config, i.e. it has
 // sso_account_id/sso_role_name plus a resolvable start URL and region
@@ -225,6 +233,37 @@ func Logout(ctx context.Context) (<-chan string, <-chan error) {
 // SSO session (cheap: it doesn't trigger a login, just checks the cache).
 func CheckStatus(profile string) bool {
 	return exec.Command("aws", "sts", "get-caller-identity", "--profile", profile).Run() == nil
+}
+
+// SessionExpiry returns when the SSO session backing profile expires, read
+// straight from the AWS CLI's own token cache (~/.aws/sso/cache) — no extra
+// AWS calls needed. The cache file is named after the sha1 of the start URL,
+// which is how `aws sso login` keys it. ok is false if there's no cached
+// token for this start URL (never logged in, or already logged out).
+func SessionExpiry(profile Profile) (expiresAt time.Time, ok bool) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return time.Time{}, false
+	}
+	sum := sha1.Sum([]byte(profile.StartURL))
+	path := filepath.Join(home, ".aws", "sso", "cache", fmt.Sprintf("%x.json", sum))
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	var cache struct {
+		StartURL  string `json:"startUrl"`
+		ExpiresAt string `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(data, &cache); err != nil || cache.StartURL == "" || cache.ExpiresAt == "" {
+		return time.Time{}, false
+	}
+	expiresAt, err = time.Parse(time.RFC3339, cache.ExpiresAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return expiresAt, true
 }
 
 // --- New-profile wizard: device authorization, account/role discovery ---

@@ -17,12 +17,21 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"scriptstui/internal/awscreds"
+	"scriptstui/internal/clipboard"
 	"scriptstui/internal/config"
+	"scriptstui/internal/prefs"
 	"scriptstui/internal/procman"
 	"scriptstui/internal/ssologin"
 )
 
 const maxLogLines = 2000
+
+// ssoDeviceCodePattern matches the "XXXX-XXXX" device code `aws sso login`
+// prints on its own line, so we can splice it onto the verification URL it
+// printed just above into one pasteable link. Shared with the desktop
+// front end (see desktop/app.go) via ssologin.DeviceCodePattern.
+var ssoDeviceCodePattern = ssologin.DeviceCodePattern
+
 const listWidth = 66
 const titleFieldWidth = 34
 
@@ -186,6 +195,7 @@ func validatePastedCredsCmd(text string, targets []string) tea.Cmd {
 type ssoRefreshMsg struct {
 	profiles []ssologin.Profile
 	status   map[string]bool
+	expiry   map[string]time.Time
 	err      error
 }
 
@@ -196,10 +206,14 @@ func refreshSSOCmd() tea.Cmd {
 			return ssoRefreshMsg{err: err}
 		}
 		status := make(map[string]bool, len(profiles))
+		expiry := make(map[string]time.Time, len(profiles))
 		for _, p := range profiles {
 			status[p.Name] = ssologin.CheckStatus(p.Name)
+			if t, ok := ssologin.SessionExpiry(p); ok {
+				expiry[p.Name] = t
+			}
 		}
-		return ssoRefreshMsg{profiles: profiles, status: status}
+		return ssoRefreshMsg{profiles: profiles, status: status, expiry: expiry}
 	}
 }
 
@@ -379,18 +393,25 @@ func newCredsTextarea(totalWidth int) (textarea.Model, tea.Cmd) {
 }
 
 type Model struct {
-	mgr           *procman.Manager
-	services      []*serviceState
-	index         map[string]int
-	cursor        int
-	marked        map[string]bool
-	tunnelProfile map[string]string // service ID -> AWS CLI profile name to use
+	mgr      *procman.Manager
+	services []*serviceState
+	index    map[string]int
+	cursor   int
+	marked   map[string]bool
+	// tunnelProfile maps service ID -> AWS CLI profile name. Loaded from the
+	// prefs file at startup and written back on every change, so an assignment
+	// survives restarts instead of having to be picked again each session.
+	tunnelProfile map[string]string
+	prefsErr      string // last failure writing the prefs file, shown in the UI
 
-	viewport   viewport.Model
-	ready      bool
-	width      int
-	height     int
-	listHeight int
+	viewport viewport.Model
+	ready    bool
+	// commandBlock is the selected tunnel's command line, already wrapped and
+	// height-budgeted by layout() so the view just prints it.
+	commandBlock string
+	width        int
+	height       int
+	listHeight   int
 
 	mode          mode
 	credsInput    textarea.Model
@@ -402,6 +423,7 @@ type Model struct {
 
 	discoveredProfiles []ssologin.Profile
 	ssoStatus          map[string]bool
+	ssoExpiry          map[string]time.Time
 	ssoCursor          int
 	ssoRunning         bool
 	ssoAction          string
@@ -411,9 +433,15 @@ type Model struct {
 	ssoDone            <-chan error
 	ssoCancel          context.CancelFunc
 	ssoRefreshErr      string
+	ssoPendingURL      string
 
 	assignTarget string
 	assignCursor int
+
+	// copyStatus replaces the log header's hint for a few seconds after 'y',
+	// to confirm the command was copied (or say why it wasn't).
+	copyStatus      string
+	copyStatusUntil time.Time
 
 	np *newProfileWizard
 
@@ -435,8 +463,9 @@ func NewModel(services []config.Service, mgr *procman.Manager) Model {
 		services:      states,
 		index:         index,
 		marked:        make(map[string]bool),
-		tunnelProfile: make(map[string]string),
+		tunnelProfile: prefs.LoadTunnelProfiles(),
 		ssoStatus:     make(map[string]bool),
+		ssoExpiry:     make(map[string]time.Time),
 	}
 }
 
@@ -520,11 +549,133 @@ func (m *Model) refreshViewportContent() {
 	m.viewport.GotoBottom()
 }
 
+// logHeader builds the line above the logs: which tunnel, its profile, and
+// either the available shortcuts or the copy confirmation. It is wrapped to
+// width here so layout() can measure the exact number of rows it will take —
+// the hint is long enough to wrap on narrower terminals.
+func (m Model) logHeader(width int) string {
+	sel := m.selected()
+
+	profileInfo := "sin perfil asignado"
+	if p := m.tunnelProfile[sel.cfg.ID]; p != "" {
+		profileInfo = "perfil: " + p
+	}
+
+	hint := itemDimStyle.Render("(" + profileInfo + " · p cambiar perfil · y copiar comando)")
+	if m.copyStatus != "" {
+		style := lipgloss.NewStyle().Bold(true).Foreground(colorRunning)
+		if strings.HasPrefix(m.copyStatus, "✗") {
+			style = modalErrStyle
+		}
+		hint = style.Render(m.copyStatus)
+	}
+
+	line := logHeaderStyle.Render("Logs — "+sel.cfg.Title) + "  " + hint
+	return lipgloss.NewStyle().Width(width).Render(line)
+}
+
+// commandFor returns the tunnel's command line(s) exactly as they will run —
+// profile included, one per line, unwrapped — which is what gets copied.
+func (m Model) commandFor(s *serviceState) string {
+	profile := m.tunnelProfile[s.cfg.ID]
+	lines := make([]string, len(s.cfg.Steps))
+	for i, step := range s.cfg.Steps {
+		if step.Kind == config.StepTunnel && profile != "" {
+			step.Profile = profile
+		}
+		lines[i] = step.CommandLine()
+	}
+	return strings.Join(lines, "\n")
+}
+
+// commandView renders the highlighted tunnel's full `aws ssm start-session`
+// line, broken before each flag the way it is written in internal/config, so
+// it can be read at a glance and pasted into a terminal to run by hand. The
+// assigned profile is spliced in, so what is shown is what will actually run.
+func (m Model) commandView(width int) string {
+	sel := m.selected()
+	profile := m.tunnelProfile[sel.cfg.ID]
+	style := lipgloss.NewStyle().Foreground(colorMuted)
+
+	var blocks []string
+	for _, step := range sel.cfg.Steps {
+		if step.Kind == config.StepTunnel && profile != "" {
+			step.Profile = profile
+		}
+		blocks = append(blocks, style.Render(formatCommand(step.CommandLine(), width)))
+	}
+	return strings.Join(blocks, "\n")
+}
+
+// formatCommand lays a one-line command out as the multi-line, backslash-
+// continued form: the program first, then one `--flag value` per line, each
+// wrapped to width. Breaks land before a flag or at a space wherever possible,
+// so what is shown still runs when pasted — the one exception being the
+// --parameters JSON, which is a single token longer than any panel and has to
+// be split mid-value to be shown in full.
+func formatCommand(line string, width int) string {
+	if width < 24 {
+		width = 24
+	}
+
+	var lines []string
+	parts := splitOnFlags(line)
+	for i, part := range parts {
+		if i > 0 {
+			part = "  " + part // hanging indent under the program name
+		}
+		// -2 leaves room for the " \" continuation marker.
+		chunks := wrapTokens(part, width-2)
+		if i < len(parts)-1 {
+			chunks[len(chunks)-1] += " \\"
+		}
+		lines = append(lines, chunks...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// splitOnFlags cuts a command line into the program plus one segment per
+// `--flag value` pair. It only ever breaks before a `--` token, never inside
+// a value.
+func splitOnFlags(line string) []string {
+	var out []string
+	var cur []string
+	for _, tok := range strings.Split(line, " ") {
+		if strings.HasPrefix(tok, "--") && len(cur) > 0 {
+			out = append(out, strings.Join(cur, " "))
+			cur = nil
+		}
+		cur = append(cur, tok)
+	}
+	if len(cur) > 0 {
+		out = append(out, strings.Join(cur, " "))
+	}
+	return out
+}
+
+// wrapTokens breaks s into visual lines of at most width, preferring the last
+// space that fits so tokens stay whole, and cutting mid-token only when the
+// token itself is wider than width.
+func wrapTokens(s string, width int) []string {
+	if width < 8 {
+		width = 8
+	}
+	var out []string
+	for len(s) > width {
+		cut := strings.LastIndex(s[:width+1], " ")
+		if cut <= 0 {
+			cut = width
+		}
+		out = append(out, strings.TrimRight(s[:cut], " "))
+		s = strings.TrimLeft(s[cut:], " ")
+	}
+	return append(out, s)
+}
+
 func (m *Model) layout() {
 	const headerHeight = 1
 	const footerHeight = 1
-	const borderHeight = 2    // top + bottom border, shared by both panels
-	const logHeaderHeight = 1 // "Logs — ..." line drawn inside the log box
+	const borderHeight = 2 // top + bottom border, shared by both panels
 
 	bodyHeight := m.height - headerHeight - footerHeight
 	if bodyHeight < 5 {
@@ -536,7 +687,28 @@ func (m *Model) layout() {
 	}
 
 	m.listHeight = bodyHeight - borderHeight
-	logViewportHeight := bodyHeight - borderHeight - logHeaderHeight
+
+	// The command block sits between the log header and the logs. Its height
+	// depends on the selected tunnel and how far its line wraps, so measure it
+	// rather than reserving a fixed number of rows — and cap it so a short
+	// terminal still shows some logs instead of pushing the panel off screen.
+	available := m.listHeight - lipgloss.Height(m.logHeader(logWidth))
+	if available < 2 {
+		available = 2
+	}
+	m.commandBlock = m.commandView(logWidth)
+	maxCommandHeight := available - 4 // blank separator + 3 rows of logs
+	if maxCommandHeight < 1 {
+		maxCommandHeight = 1
+	}
+	if lines := strings.Split(m.commandBlock, "\n"); len(lines) > maxCommandHeight {
+		m.commandBlock = strings.Join(append(lines[:maxCommandHeight-1], itemDimStyle.Render("  …")), "\n")
+	}
+
+	logViewportHeight := available - lipgloss.Height(m.commandBlock) - 1
+	if logViewportHeight < 1 {
+		logViewportHeight = 1
+	}
 
 	if !m.ready {
 		m.viewport = viewport.New(logWidth, logViewportHeight)
@@ -557,6 +729,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
+		if m.copyStatus != "" && time.Now().After(m.copyStatusUntil) {
+			m.copyStatus = ""
+			m.layout()
+		}
 		return m, tick()
 
 	case tea.KeyMsg:
@@ -581,10 +757,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ssoRefreshErr = ""
 		m.discoveredProfiles = msg.profiles
 		m.ssoStatus = msg.status
+		m.ssoExpiry = msg.expiry
 		return m, nil
 
 	case ssoLineMsg:
-		m.ssoOutput = append(m.ssoOutput, msg.line)
+		trimmed := strings.TrimSpace(msg.line)
+		switch {
+		case strings.HasPrefix(trimmed, "https://"):
+			m.ssoPendingURL = trimmed
+			m.ssoOutput = append(m.ssoOutput, msg.line)
+		case m.ssoPendingURL != "" && ssoDeviceCodePattern.MatchString(trimmed):
+			m.ssoOutput = append(m.ssoOutput,
+				msg.line,
+				"",
+				"Enlace completo (copiar y pegar en el navegador):",
+				m.ssoPendingURL+"?user_code="+trimmed,
+			)
+			m.ssoPendingURL = ""
+		default:
+			m.ssoOutput = append(m.ssoOutput, msg.line)
+		}
 		if len(m.ssoOutput) > maxLogLines {
 			m.ssoOutput = m.ssoOutput[len(m.ssoOutput)-maxLogLines:]
 		}
@@ -679,6 +871,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			"✓ perfil creado: " + msg.profileName,
 			"Iniciando sesión (puede pedir aprobar el navegador una vez más)...",
 		}
+		m.ssoPendingURL = ""
 		m.ssoLines, m.ssoDone = lines, done
 		return m, tea.Batch(refreshSSOCmd(), waitSSOOutput(lines, done, msg.profileName, "login"))
 
@@ -778,13 +971,13 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
-			m.refreshViewportContent()
+			m.layout()
 		}
 		return m, nil
 	case "down", "j":
 		if m.cursor < len(m.services)-1 {
 			m.cursor++
-			m.refreshViewportContent()
+			m.layout()
 		}
 		return m, nil
 	case " ":
@@ -818,6 +1011,17 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.mode = modeAssignProfile
+		return m, nil
+	case "y":
+		// Copy the single-line form: it pastes cleanly into any shell,
+		// unlike the wrapped, backslash-continued one on screen.
+		if err := clipboard.Copy(m.commandFor(m.selected())); err != nil {
+			m.copyStatus = "✗ no se pudo copiar: " + err.Error()
+		} else {
+			m.copyStatus = "✓ comando copiado al portapapeles"
+		}
+		m.copyStatusUntil = time.Now().Add(4 * time.Second)
+		m.layout()
 		return m, nil
 	case "?":
 		m.showHelp = !m.showHelp
@@ -911,6 +1115,7 @@ func (m Model) updateSSO(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ssoAction = "login"
 		m.ssoActiveProfile = p.Name
 		m.ssoOutput = nil
+		m.ssoPendingURL = ""
 		m.ssoLines, m.ssoDone = lines, done
 		return m, waitSSOOutput(lines, done, p.Name, "login")
 	case "x", "L":
@@ -952,6 +1157,11 @@ func (m Model) updateAssignProfile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.tunnelProfile[m.assignTarget] = m.discoveredProfiles[m.assignCursor-1].Name
 		}
+		m.prefsErr = ""
+		if err := prefs.SaveTunnelProfiles(m.tunnelProfile); err != nil {
+			m.prefsErr = "no se pudo guardar el perfil: " + err.Error()
+		}
+		m.layout()
 		m.mode = modeList
 		return m, nil
 	}
@@ -1148,20 +1358,22 @@ func (m Model) viewList() string {
 	}
 	listPanel := listBoxStyle.Width(listWidth).Height(m.listHeight).Render(list.String())
 
-	sel := m.selected()
-	profileInfo := "sin perfil asignado"
-	if p := m.tunnelProfile[sel.cfg.ID]; p != "" {
-		profileInfo = "perfil: " + p
+	logHeader := m.logHeader(m.viewport.Width)
+	if m.prefsErr != "" {
+		logHeader += "  " + modalErrStyle.Render(m.prefsErr)
 	}
-	logHeader := logHeaderStyle.Render("Logs — "+sel.cfg.Title) + "  " +
-		itemDimStyle.Render("("+profileInfo+" · p para cambiar)")
-	logPanel := logBoxStyle.Render(logHeader + "\n" + m.viewport.View())
+	logPanel := logBoxStyle.
+		Width(m.viewport.Width).
+		Height(m.listHeight).
+		MaxHeight(m.listHeight + 2). // + top and bottom border
+		Render(logHeader + "\n" + m.commandBlock + "\n\n" + m.viewport.View())
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listPanel, logPanel)
 
 	help := helpEntry("enter/s", "iniciar") + "  " +
 		helpEntry("x", "detener") + "  " +
-		helpEntry("v", "ver todos los logs") + "  " +
+		helpEntry("y", "copiar") + "  " +
+		helpEntry("v", "todos los logs") + "  " +
 		helpEntry("a", "cuentas AWS") + "  " +
 		helpEntry("?", "ayuda") + "  " +
 		helpEntry("q", "salir")
@@ -1219,6 +1431,7 @@ func (m Model) viewHelp() string {
 	b.WriteString(helpEntry("x", "detener el resaltado (o los marcados)") + "\n")
 	b.WriteString(helpEntry("espacio", "marcar varios túneles para iniciarlos/detenerlos juntos") + "\n")
 	b.WriteString(helpEntry("p", "elegir el perfil AWS del túnel resaltado") + "\n")
+	b.WriteString(helpEntry("y", "copiar al portapapeles el comando aws ssm del túnel resaltado") + "\n")
 	b.WriteString(helpEntry("v", "ver los logs de los 3 túneles a la vez") + "\n")
 	b.WriteString(helpEntry("pgup/pgdn", "scroll de los logs") + "\n")
 
@@ -1299,6 +1512,26 @@ func (m Model) viewAssignProfile() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
+// ssoExpiryLabel renders how much longer a logged-in SSO session has left,
+// e.g. " · vence en 3h 42m", based on the AWS CLI's own cached token
+// expiry. Empty if we have no cached expiry to show.
+func ssoExpiryLabel(expiresAt time.Time) string {
+	if expiresAt.IsZero() {
+		return ""
+	}
+	remaining := time.Until(expiresAt)
+	if remaining <= 0 {
+		return " · vence en breve"
+	}
+	remaining = remaining.Round(time.Minute)
+	h := remaining / time.Hour
+	mins := (remaining % time.Hour) / time.Minute
+	if h > 0 {
+		return fmt.Sprintf(" · vence en %dh %dm", h, mins)
+	}
+	return fmt.Sprintf(" · vence en %dm", mins)
+}
+
 func (m Model) viewSSO() string {
 	header := titleStyle.Render("scriptstui — cuentas AWS SSO")
 
@@ -1321,7 +1554,7 @@ func (m Model) viewSSO() string {
 
 		badge := itemDimStyle.Render("✗ no logueado")
 		if m.ssoStatus[p.Name] {
-			badge = checkedStyle.Render("✓ logueado")
+			badge = checkedStyle.Render("✓ logueado" + ssoExpiryLabel(m.ssoExpiry[p.Name]))
 		}
 
 		list.WriteString(marker + titleRendered + " " + badge + "\n")
