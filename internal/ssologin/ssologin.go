@@ -235,35 +235,98 @@ func CheckStatus(profile string) bool {
 	return exec.Command("aws", "sts", "get-caller-identity", "--profile", profile).Run() == nil
 }
 
-// SessionExpiry returns when the SSO session backing profile expires, read
-// straight from the AWS CLI's own token cache (~/.aws/sso/cache) — no extra
-// AWS calls needed. The cache file is named after the sha1 of the start URL,
-// which is how `aws sso login` keys it. ok is false if there's no cached
-// token for this start URL (never logged in, or already logged out).
-func SessionExpiry(profile Profile) (expiresAt time.Time, ok bool) {
+// cachedSession is one entry of the AWS CLI's own SSO token cache under
+// ~/.aws/sso/cache, i.e. what `aws sso login` leaves behind for a start URL.
+type cachedSession struct {
+	StartURL    string `json:"startUrl"`
+	Region      string `json:"region"`
+	AccessToken string `json:"accessToken"`
+	ExpiresAt   string `json:"expiresAt"`
+}
+
+// parseCacheTime accepts both shapes the AWS CLI has written into that cache
+// over the years: RFC3339 ("2026-08-27T18:00:00Z") and the older botocore
+// style with a literal zone name ("2026-08-27T18:00:00UTC").
+func parseCacheTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	return time.Parse("2006-01-02T15:04:05UTC", s)
+}
+
+// findCachedSession looks up the cached SSO token for startURL. The CLI names
+// the file after the sha1 of the start URL for flat profiles but after the
+// session name for `sso_session =` ones, so try the sha1 first and otherwise
+// scan the directory for an entry whose startUrl matches; with several
+// matches the one valid the longest wins.
+func findCachedSession(startURL string) (cachedSession, time.Time, bool) {
+	if startURL == "" {
+		return cachedSession{}, time.Time{}, false
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return time.Time{}, false
+		return cachedSession{}, time.Time{}, false
 	}
-	sum := sha1.Sum([]byte(profile.StartURL))
-	path := filepath.Join(home, ".aws", "sso", "cache", fmt.Sprintf("%x.json", sum))
+	dir := filepath.Join(home, ".aws", "sso", "cache")
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return time.Time{}, false
+	sum := sha1.Sum([]byte(startURL))
+	paths := []string{filepath.Join(dir, fmt.Sprintf("%x.json", sum))}
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+				paths = append(paths, filepath.Join(dir, e.Name()))
+			}
+		}
 	}
-	var cache struct {
-		StartURL  string `json:"startUrl"`
-		ExpiresAt string `json:"expiresAt"`
+
+	var best cachedSession
+	var bestExpiry time.Time
+	found := false
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var sess cachedSession
+		if err := json.Unmarshal(data, &sess); err != nil || sess.StartURL != startURL || sess.ExpiresAt == "" {
+			continue
+		}
+		expiresAt, err := parseCacheTime(sess.ExpiresAt)
+		if err != nil {
+			continue
+		}
+		if !found || expiresAt.After(bestExpiry) {
+			best, bestExpiry, found = sess, expiresAt, true
+		}
 	}
-	if err := json.Unmarshal(data, &cache); err != nil || cache.StartURL == "" || cache.ExpiresAt == "" {
-		return time.Time{}, false
+	return best, bestExpiry, found
+}
+
+// SessionExpiry returns when the SSO session backing profile expires, read
+// straight from the AWS CLI's own token cache (~/.aws/sso/cache) — no extra
+// AWS calls needed. ok is false if there's no cached token for this start URL
+// (never logged in, or already logged out).
+func SessionExpiry(profile Profile) (expiresAt time.Time, ok bool) {
+	_, expiresAt, ok = findCachedSession(profile.StartURL)
+	return expiresAt, ok
+}
+
+// CachedToken returns the still-valid SSO access token the AWS CLI already
+// cached for profile's start URL, so we can list every account and role the
+// user can reach without sending them through a second device-authorization
+// dance. ok is false when there is no cached token or it already expired, in
+// which case the caller should log in (or run the wizard) first.
+func CachedToken(profile Profile) (token, region string, ok bool) {
+	sess, expiresAt, found := findCachedSession(profile.StartURL)
+	if !found || sess.AccessToken == "" || !expiresAt.After(time.Now()) {
+		return "", "", false
 	}
-	expiresAt, err = time.Parse(time.RFC3339, cache.ExpiresAt)
-	if err != nil {
-		return time.Time{}, false
+	region = sess.Region
+	if region == "" {
+		region = profile.SSORegion
 	}
-	return expiresAt, true
+	return sess.AccessToken, region, true
 }
 
 // --- New-profile wizard: device authorization, account/role discovery ---
@@ -511,28 +574,28 @@ func sanitizeName(s string) string {
 // WriteProfile adds a [profile name] section to ~/.aws/config with the
 // legacy flat SSO fields (no separate [sso-session] indirection needed —
 // `aws sso login --profile name` works fine with this shape too). If a
-// section with that name already exists, this is a no-op: profile names are
-// derived from account+role, so an existing one just means it was already
-// set up.
-func WriteProfile(name, startURL, ssoRegion, accountID, roleName, cliRegion string) error {
+// section with that name already exists this is a no-op and existed is true:
+// profile names are derived from account+role, so an existing one just means
+// it was already set up.
+func WriteProfile(name, startURL, ssoRegion, accountID, roleName, cliRegion string) (existed bool, err error) {
 	path, err := configPath()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return false, err
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
-		return err
+		return false, err
 	}
 	content := string(data)
 
 	header := "[profile " + name + "]"
 	for _, line := range strings.Split(content, "\n") {
 		if strings.TrimSpace(line) == header {
-			return nil
+			return true, nil
 		}
 	}
 
@@ -552,5 +615,79 @@ func WriteProfile(name, startURL, ssoRegion, accountID, roleName, cliRegion stri
 	}
 	content += block
 
-	return os.WriteFile(path, []byte(content), 0o600)
+	return false, os.WriteFile(path, []byte(content), 0o600)
+}
+
+// maxRoleLookups caps how many `aws sso list-account-roles` calls run at
+// once: each one is its own CLI process, so a wide portal would otherwise
+// either crawl through them one by one or fork dozens of processes at a time.
+const maxRoleLookups = 6
+
+// ImportResult summarizes one "bring in every account I can see" run.
+type ImportResult struct {
+	Accounts int      // accounts the portal listed for this user
+	Written  []string // profiles added to ~/.aws/config just now
+	Existing []string // profiles that were already there
+	Warnings []string // accounts/profiles we could not do, the rest still went in
+}
+
+// ImportAllProfiles walks every account the SSO user can see and every role
+// they can assume in each one, writing a profile per account+role pair into
+// ~/.aws/config. It is safe to re-run: pairs that already have a profile are
+// left untouched and only counted. A single account failing to list its roles
+// becomes a warning, not a failed import.
+func ImportAllProfiles(ctx context.Context, region, startURL, accessToken string) (ImportResult, error) {
+	accounts, err := ListAccounts(ctx, region, accessToken)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	sort.Slice(accounts, func(i, j int) bool { return accounts[i].AccountName < accounts[j].AccountName })
+
+	result := ImportResult{Accounts: len(accounts)}
+
+	type accountRoles struct {
+		roles []Role
+		err   error
+	}
+	found := make([]accountRoles, len(accounts))
+
+	sem := make(chan struct{}, maxRoleLookups)
+	var wg sync.WaitGroup
+	for i, a := range accounts {
+		wg.Add(1)
+		go func(i int, a Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			roles, err := ListAccountRoles(ctx, region, accessToken, a.AccountID)
+			found[i] = accountRoles{roles: roles, err: err}
+		}(i, a)
+	}
+	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+
+	// Writing touches ~/.aws/config, so it happens here, in account order:
+	// deterministic, and never two goroutines rewriting the same file.
+	for i, a := range accounts {
+		if found[i].err != nil {
+			result.Warnings = append(result.Warnings, a.AccountName+" ("+a.AccountID+"): "+found[i].err.Error())
+			continue
+		}
+		for _, r := range found[i].roles {
+			name := ProfileName(a.AccountID, r.RoleName)
+			existed, err := WriteProfile(name, startURL, region, a.AccountID, r.RoleName, region)
+			switch {
+			case err != nil:
+				result.Warnings = append(result.Warnings, name+": "+err.Error())
+			case existed:
+				result.Existing = append(result.Existing, name)
+			default:
+				result.Written = append(result.Written, name)
+			}
+		}
+	}
+	return result, nil
 }

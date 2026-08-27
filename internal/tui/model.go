@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -34,6 +35,28 @@ var ssoDeviceCodePattern = ssologin.DeviceCodePattern
 
 const listWidth = 66
 const titleFieldWidth = 34
+
+// maxImportWarnings caps how many per-account problems an import prints
+// before collapsing the rest into a count, so one broken account can't push
+// the summary off the panel.
+const maxImportWarnings = 5
+
+// visibleWindow returns the [start,end) slice of a list of total items that
+// fits in maxItems rows while keeping cursor inside it — importing a whole
+// portal can easily produce more profiles than the terminal has rows.
+func visibleWindow(cursor, total, maxItems int) (int, int) {
+	if maxItems <= 0 || total <= maxItems {
+		return 0, total
+	}
+	start := cursor - maxItems/2
+	if start < 0 {
+		start = 0
+	}
+	if start+maxItems > total {
+		start = total - maxItems
+	}
+	return start, start + maxItems
+}
 
 type mode int
 
@@ -205,15 +228,51 @@ func refreshSSOCmd() tea.Cmd {
 		if err != nil {
 			return ssoRefreshMsg{err: err}
 		}
+		// One `aws sts get-caller-identity` per profile, so once a whole
+		// portal has been imported this has to fan out: sequentially it would
+		// freeze the panel for a minute on every refresh.
 		status := make(map[string]bool, len(profiles))
 		expiry := make(map[string]time.Time, len(profiles))
+		var mu sync.Mutex
+		sem := make(chan struct{}, 8)
+		var wg sync.WaitGroup
 		for _, p := range profiles {
-			status[p.Name] = ssologin.CheckStatus(p.Name)
-			if t, ok := ssologin.SessionExpiry(p); ok {
-				expiry[p.Name] = t
-			}
+			wg.Add(1)
+			go func(p ssologin.Profile) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				loggedIn := ssologin.CheckStatus(p.Name)
+				expiresAt, hasExpiry := ssologin.SessionExpiry(p)
+				mu.Lock()
+				defer mu.Unlock()
+				status[p.Name] = loggedIn
+				if hasExpiry {
+					expiry[p.Name] = expiresAt
+				}
+			}(p)
 		}
+		wg.Wait()
 		return ssoRefreshMsg{profiles: profiles, status: status, expiry: expiry}
+	}
+}
+
+// ssoImportMsg carries the outcome of importing every account and role the
+// SSO user can reach into ~/.aws/config.
+type ssoImportMsg struct {
+	result ssologin.ImportResult
+	err    error
+}
+
+// importAllProfilesCmd creates one profile per account+role pair the portal
+// at startURL exposes to this user, reusing an SSO access token we already
+// have so nobody has to approve a second browser prompt.
+func importAllProfilesCmd(region, startURL, token string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		result, err := ssologin.ImportAllProfiles(ctx, region, startURL, token)
+		return ssoImportMsg{result: result, err: err}
 	}
 }
 
@@ -370,7 +429,7 @@ func npListRolesCmd(ctx context.Context, region, token, accountID string) tea.Cm
 
 func npWriteProfileCmd(name, startURL, region, accountID, roleName string) tea.Cmd {
 	return func() tea.Msg {
-		err := ssologin.WriteProfile(name, startURL, region, accountID, roleName, region)
+		_, err := ssologin.WriteProfile(name, startURL, region, accountID, roleName, region)
 		return npWriteDoneMsg{profileName: name, err: err}
 	}
 }
@@ -433,6 +492,8 @@ type Model struct {
 	ssoDone            <-chan error
 	ssoCancel          context.CancelFunc
 	ssoRefreshErr      string
+	ssoRefreshing      bool
+	ssoImporting       bool
 	ssoPendingURL      string
 
 	assignTarget string
@@ -750,14 +811,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case ssoRefreshMsg:
+		m.ssoRefreshing = false
 		if msg.err != nil {
 			m.ssoRefreshErr = msg.err.Error()
 			return m, nil
 		}
 		m.ssoRefreshErr = ""
+		// A refresh can add, remove or reorder profiles, so remember which
+		// one each cursor was pointing at (by name) and put it back there.
+		// Keeping the raw index would silently move the selection onto a
+		// different profile, or past the end of the list.
+		ssoName, assignName := "", ""
+		if m.ssoCursor < len(m.discoveredProfiles) {
+			ssoName = m.discoveredProfiles[m.ssoCursor].Name
+		}
+		if m.assignCursor > 0 && m.assignCursor-1 < len(m.discoveredProfiles) {
+			assignName = m.discoveredProfiles[m.assignCursor-1].Name
+		}
 		m.discoveredProfiles = msg.profiles
 		m.ssoStatus = msg.status
 		m.ssoExpiry = msg.expiry
+
+		if i := profileIndex(msg.profiles, ssoName); i >= 0 {
+			m.ssoCursor = i
+		} else if m.ssoCursor >= len(msg.profiles) {
+			m.ssoCursor = 0
+		}
+		// 0 is "ninguno" in the assignment picker, hence the +1 offset.
+		if i := profileIndex(msg.profiles, assignName); i >= 0 {
+			m.assignCursor = i + 1
+		} else if m.assignCursor > len(msg.profiles) {
+			m.assignCursor = 0
+		}
 		return m, nil
 
 	case ssoLineMsg:
@@ -790,6 +875,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.ssoOutput = append(m.ssoOutput, "✓ listo")
 		}
+		return m, refreshSSOCmd()
+
+	case ssoImportMsg:
+		m.ssoImporting = false
+		if msg.err != nil {
+			m.ssoOutput = append(m.ssoOutput, "✗ "+msg.err.Error())
+			return m, refreshSSOCmd()
+		}
+		r := msg.result
+		m.ssoOutput = append(m.ssoOutput, fmt.Sprintf(
+			"✓ %d cuentas revisadas · %d perfiles nuevos · %d ya existían",
+			r.Accounts, len(r.Written), len(r.Existing)))
+		switch {
+		case r.Accounts == 0:
+			m.ssoOutput = append(m.ssoOutput, "Este portal no reporta ninguna cuenta asignada a tu usuario.")
+		case len(r.Written) == 0 && len(r.Warnings) == 0:
+			m.ssoOutput = append(m.ssoOutput, "Ya tenías un perfil por cada cuenta y rol de este portal.")
+		}
+		for i, w := range r.Warnings {
+			if i == maxImportWarnings {
+				m.ssoOutput = append(m.ssoOutput, fmt.Sprintf("  ! y %d avisos más", len(r.Warnings)-i))
+				break
+			}
+			m.ssoOutput = append(m.ssoOutput, "  ! "+w)
+		}
+		m.ssoRefreshing = true
 		return m, refreshSSOCmd()
 
 	case npDeviceStartedMsg:
@@ -1097,7 +1208,30 @@ func (m Model) updateSSO(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "r":
+		m.ssoRefreshing = true
 		return m, refreshSSOCmd()
+	case "i":
+		if m.ssoRunning || m.ssoImporting {
+			return m, nil
+		}
+		if len(m.discoveredProfiles) == 0 {
+			m.ssoOutput = []string{"Todavía no hay ningún portal configurado: usa 'n' para crear el primer perfil."}
+			return m, nil
+		}
+		// The cursor's profile only tells us which portal to walk; the token
+		// comes from the CLI's own cache, which is per start URL, not per
+		// profile — so any logged-in profile of that portal works.
+		p := m.discoveredProfiles[m.ssoCursor]
+		token, region, ok := ssologin.CachedToken(p)
+		if !ok {
+			m.ssoOutput = []string{
+				"Para traer todas las cuentas, primero inicia sesión (enter) en un perfil de este portal.",
+			}
+			return m, nil
+		}
+		m.ssoImporting = true
+		m.ssoOutput = []string{"Buscando todas las cuentas y roles de " + p.StartURL + "..."}
+		return m, importAllProfilesCmd(region, p.StartURL, token)
 	case "n":
 		var focusCmd tea.Cmd
 		m.np, focusCmd = newProfileWizardForm(m.width)
@@ -1151,6 +1285,9 @@ func (m Model) updateAssignProfile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.assignCursor++
 		}
 		return m, nil
+	case "r":
+		m.ssoRefreshing = true
+		return m, refreshSSOCmd()
 	case "enter":
 		if m.assignCursor == 0 {
 			delete(m.tunnelProfile, m.assignTarget)
@@ -1263,6 +1400,21 @@ func (m Model) updateNewProfile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.np.accountCursor++
 			}
 			return m, nil
+		case "i":
+			if !m.np.accountsLoaded || len(m.np.accounts) == 0 {
+				return m, nil
+			}
+			// The wizard's job is done: it got us a token for the portal, and
+			// the import needs nothing else, so hand off to the SSO panel.
+			region, startURL, token := m.np.region, m.np.startURL, m.np.accessToken
+			if m.np.cancel != nil {
+				m.np.cancel()
+			}
+			m.np = nil
+			m.mode = modeSSO
+			m.ssoImporting = true
+			m.ssoOutput = []string{"Creando un perfil por cada cuenta y rol de " + startURL + "..."}
+			return m, importAllProfilesCmd(region, startURL, token)
 		case "enter":
 			if len(m.np.accounts) == 0 {
 				return m, nil
@@ -1440,6 +1592,8 @@ func (m Model) viewHelp() string {
 	b.WriteString("\n")
 	b.WriteString(helpEntry("a", "abrir el panel de cuentas AWS SSO (recomendado)") + "\n")
 	b.WriteString(helpEntry("c", "pegar credenciales manualmente (respaldo)") + "\n")
+	b.WriteString(helpEntry("r", "recargar los perfiles de ~/.aws/config (en 'a' y en 'p')") + "\n")
+	b.WriteString(helpEntry("i", "en 'a': crear un perfil por cada cuenta y rol del portal") + "\n")
 
 	b.WriteString("\n")
 	b.WriteString(helpEntry("q", "salir") + "  " + helpEntry("(cualquier tecla)", "cerrar esta ayuda"))
@@ -1498,18 +1652,57 @@ func (m Model) viewAssignProfile() string {
 	renderRow(0, "ninguno", "usar credenciales pegadas ('c') o las ambientales")
 	if len(m.discoveredProfiles) == 0 {
 		b.WriteString("\n")
-		b.WriteString(modalHintStyle.Render("No hay perfiles SSO en ~/.aws/config.\nAbre el panel de cuentas ('a') y presiona 'n' para crear uno."))
+		b.WriteString(modalHintStyle.Render("No hay perfiles SSO en ~/.aws/config.\nPresiona 'r' para recargarlos, o abre el panel de cuentas ('a') y presiona 'n' para crear uno."))
 		b.WriteString("\n")
 	}
-	for i, p := range m.discoveredProfiles {
+	// Two rows per profile inside a centered modal: title, blank, "ninguno",
+	// blank, status, help and the box chrome take the rest of the height.
+	maxProfiles := (m.height - 14) / 2
+	if maxProfiles < 2 {
+		maxProfiles = 2
+	}
+	cursor := m.assignCursor - 1 // "ninguno" is row 0, profiles start at 1
+	if cursor < 0 {
+		cursor = 0
+	}
+	start, end := visibleWindow(cursor, len(m.discoveredProfiles), maxProfiles)
+	if start > 0 {
+		b.WriteString(itemDimStyle.Render(fmt.Sprintf("  ↑ %d perfiles más arriba", start)) + "\n")
+	}
+	for i := start; i < end; i++ {
+		p := m.discoveredProfiles[i]
 		renderRow(i+1, p.Name, "cuenta "+p.AccountID+" · rol "+p.RoleName)
+	}
+	if end < len(m.discoveredProfiles) {
+		b.WriteString(itemDimStyle.Render(fmt.Sprintf("  ↓ %d perfiles más abajo", len(m.discoveredProfiles)-end)) + "\n")
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpEntry("↑/↓", "navegar") + "  " + helpEntry("enter", "elegir") + "  " + helpEntry("esc", "cancelar"))
+	if m.ssoRefreshing {
+		b.WriteString(modalHintStyle.Render("recargando perfiles...") + "\n")
+	} else if m.ssoRefreshErr != "" {
+		b.WriteString(modalErrStyle.Render("✗ "+m.ssoRefreshErr) + "\n")
+	}
+	b.WriteString(helpEntry("↑/↓", "navegar") + "  " + helpEntry("enter", "elegir") + "  " +
+		helpEntry("r", "recargar perfiles") + "  " + helpEntry("esc", "cancelar"))
 
 	box := modalBoxStyle.Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// profileIndex returns where name sits in profiles, or -1 when it is absent
+// (including for the empty name), so callers can re-anchor a cursor after the
+// list is reloaded.
+func profileIndex(profiles []ssologin.Profile, name string) int {
+	if name == "" {
+		return -1
+	}
+	for i, p := range profiles {
+		if p.Name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 // ssoExpiryLabel renders how much longer a logged-in SSO session has left,
@@ -1539,11 +1732,22 @@ func (m Model) viewSSO() string {
 	if len(m.discoveredProfiles) == 0 {
 		list.WriteString(itemDimStyle.Render("No hay perfiles SSO en ~/.aws/config todavía.\n"))
 		list.WriteString(itemDimStyle.Render("Presiona 'n' para crear uno (aws configure sso).\n"))
+		list.WriteString(itemDimStyle.Render("Desde ahí puedes traer de una vez todas tus cuentas del portal.\n"))
 		if m.ssoRefreshErr != "" {
 			list.WriteString(modalErrStyle.Render("✗ " + m.ssoRefreshErr))
 		}
 	}
-	for i, p := range m.discoveredProfiles {
+	// Two rows per profile, plus one row for each "N más" marker.
+	maxProfiles := (m.listHeight - 2) / 2
+	if maxProfiles < 1 {
+		maxProfiles = 1
+	}
+	start, end := visibleWindow(m.ssoCursor, len(m.discoveredProfiles), maxProfiles)
+	if start > 0 {
+		list.WriteString(itemDimStyle.Render(fmt.Sprintf("  ↑ %d perfiles más arriba", start)) + "\n")
+	}
+	for i := start; i < end; i++ {
+		p := m.discoveredProfiles[i]
 		marker := "  "
 		title := padTrunc(p.Name, titleFieldWidth)
 		titleRendered := itemStyle.Render(title)
@@ -1561,6 +1765,9 @@ func (m Model) viewSSO() string {
 		detail := "    cuenta " + p.AccountID + " · rol " + p.RoleName
 		list.WriteString(itemDimStyle.Render(detail) + "\n")
 	}
+	if end < len(m.discoveredProfiles) {
+		list.WriteString(itemDimStyle.Render(fmt.Sprintf("  ↓ %d perfiles más abajo", len(m.discoveredProfiles)-end)) + "\n")
+	}
 	listPanel := listBoxStyle.Width(listWidth).Height(m.listHeight).Render(list.String())
 
 	logWidth := m.width - listWidth - 6
@@ -1568,7 +1775,23 @@ func (m Model) viewSSO() string {
 		logWidth = 20
 	}
 	outHeader := logHeaderStyle.Render("Salida de aws sso")
-	outBody := strings.Join(m.ssoOutput, "\n")
+	outLines := m.ssoOutput
+	if room := m.listHeight - 3; room > 0 && len(outLines) > room {
+		outLines = outLines[len(outLines)-room:]
+	}
+	outBody := strings.Join(outLines, "\n")
+	if m.ssoImporting {
+		if outBody != "" {
+			outBody += "\n"
+		}
+		outBody += modalHintStyle.Render("importando cuentas del portal...")
+	}
+	if m.ssoRefreshing {
+		if outBody != "" {
+			outBody += "\n"
+		}
+		outBody += modalHintStyle.Render("recargando perfiles...")
+	}
 	if m.ssoRunning {
 		if outBody != "" {
 			outBody += "\n"
@@ -1581,6 +1804,7 @@ func (m Model) viewSSO() string {
 
 	help := helpEntry("↑/↓", "navegar") + "  " +
 		helpEntry("enter/l", "iniciar sesión") + "  " +
+		helpEntry("i", "traer todas las cuentas") + "  " +
 		helpEntry("n", "nuevo perfil") + "  " +
 		helpEntry("r", "refrescar") + "  " +
 		helpEntry("x", "cerrar sesión (todas)") + "  " +
@@ -1626,7 +1850,7 @@ func (m Model) viewNewProfile() string {
 		b.WriteString(helpEntry("esc", "cancelar"))
 
 	case npStepAccounts:
-		b.WriteString("Elige la cuenta:\n\n")
+		b.WriteString("Elige la cuenta, o presiona 'i' para traer todas:\n\n")
 		switch {
 		case np.err != "":
 			b.WriteString(modalErrStyle.Render("✗ " + np.err))
@@ -1635,15 +1859,29 @@ func (m Model) viewNewProfile() string {
 		case len(np.accounts) == 0:
 			b.WriteString(modalHintStyle.Render("No tienes cuentas asignadas en este portal."))
 		}
-		for i, a := range np.accounts {
-			marker, title := "  ", itemStyle.Render(a.AccountName+" ("+a.AccountID+")")
+		maxAccounts := m.height - 15
+		if maxAccounts < 3 {
+			maxAccounts = 3
+		}
+		start, end := visibleWindow(np.accountCursor, len(np.accounts), maxAccounts)
+		if start > 0 {
+			b.WriteString(itemDimStyle.Render(fmt.Sprintf("  ↑ %d cuentas más arriba", start)) + "\n")
+		}
+		for i := start; i < end; i++ {
+			a := np.accounts[i]
+			label := a.AccountName + " (" + a.AccountID + ")"
+			marker, title := "  ", itemStyle.Render(label)
 			if i == np.accountCursor {
-				marker, title = cursorStyle.Render("▶ "), selectedTitle.Render(a.AccountName+" ("+a.AccountID+")")
+				marker, title = cursorStyle.Render("▶ "), selectedTitle.Render(label)
 			}
 			b.WriteString(marker + title + "\n")
 		}
+		if end < len(np.accounts) {
+			b.WriteString(itemDimStyle.Render(fmt.Sprintf("  ↓ %d cuentas más abajo", len(np.accounts)-end)) + "\n")
+		}
 		b.WriteString("\n")
-		b.WriteString(helpEntry("↑/↓", "navegar") + "  " + helpEntry("enter", "elegir") + "  " + helpEntry("esc", "cancelar"))
+		b.WriteString(helpEntry("↑/↓", "navegar") + "  " + helpEntry("enter", "elegir") + "  " +
+			helpEntry("i", "traer todas") + "  " + helpEntry("esc", "cancelar"))
 
 	case npStepRoles:
 		b.WriteString("Elige el rol en " + np.account.AccountName + ":\n\n")

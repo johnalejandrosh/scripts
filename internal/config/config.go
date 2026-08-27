@@ -205,6 +205,17 @@ func Services() []Service {
 			},
 		},
 		{
+			ID:    "db-balu-replica",
+			Title: "Túnel DB BALU Read Replica (solo túnel)",
+			Steps: []Step{
+				tunnelStep("AWS", `aws ssm start-session \
+      --target i-074e88b2ee9d1d67f \
+      --document-name AWS-StartPortForwardingSessionToRemoteHost \
+      --parameters '{"host":["read-replica.cniu2mwmabwe.us-east-1.rds.amazonaws.com"],"portNumber":["5432"],"localPortNumber":["5440"]}' \
+      --region us-east-1`, 0),
+			},
+		},
+		{
 			ID:    "db-production",
 			Title: "Túnel DB Producción BI CNE (solo túnel)",
 			Steps: []Step{
@@ -234,6 +245,17 @@ func Services() []Service {
       --target i-074e88b2ee9d1d67f \
       --document-name AWS-StartPortForwardingSessionToRemoteHost \
       --parameters '{"host":["balu-prod-workgroup.039612858373.us-east-1.redshift-serverless.amazonaws.com"],"portNumber":["5439"],"localPortNumber":["5439"]}' \
+      --region us-east-1`, 0),
+			},
+		},
+		{
+			ID:    "fiduprevisora-qa",
+			Title: "Túnel Fiduprevisora QA (solo túnel)",
+			Steps: []Step{
+				tunnelStep("AWS", `aws ssm start-session \
+      --target i-0dfa5094b99b1d881 \
+      --document-name AWS-StartPortForwardingSessionToRemoteHost \
+      --parameters '{"host":["postgres-fiduprevisora-qa.c9u8ko0sale2.us-east-1.rds.amazonaws.com"],"portNumber":["5432"],"localPortNumber":["5434"]}' \
       --region us-east-1`, 0),
 			},
 		},

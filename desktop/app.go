@@ -191,15 +191,26 @@ func (a *App) ListSSOProfiles() ([]SSOProfileView, error) {
 	if err != nil {
 		return nil, err
 	}
+	// CheckStatus shells out to `aws sts get-caller-identity` per profile, so
+	// fan out: a user who imported a whole portal can have dozens of them.
 	out := make([]SSOProfileView, len(profiles))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
 	for i, p := range profiles {
-		v := SSOProfileView{Name: p.Name, AccountID: p.AccountID, RoleName: p.RoleName}
-		v.LoggedIn = ssologin.CheckStatus(p.Name)
-		if t, ok := ssologin.SessionExpiry(p); ok {
-			v.ExpiresAt = t.Format(time.RFC3339)
-		}
-		out[i] = v
+		wg.Add(1)
+		go func(i int, p ssologin.Profile) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			v := SSOProfileView{Name: p.Name, AccountID: p.AccountID, RoleName: p.RoleName}
+			v.LoggedIn = ssologin.CheckStatus(p.Name)
+			if t, ok := ssologin.SessionExpiry(p); ok {
+				v.ExpiresAt = t.Format(time.RFC3339)
+			}
+			out[i] = v
+		}(i, p)
 	}
+	wg.Wait()
 	return out, nil
 }
 
@@ -337,7 +348,7 @@ func (a *App) FinishNewSSOProfile(accountID, roleName, cliRegion string) (string
 	defer np.cancel()
 
 	name := ssologin.ProfileName(accountID, roleName)
-	if err := ssologin.WriteProfile(name, np.startURL, np.region, accountID, roleName, cliRegion); err != nil {
+	if _, err := ssologin.WriteProfile(name, np.startURL, np.region, accountID, roleName, cliRegion); err != nil {
 		return "", err
 	}
 
