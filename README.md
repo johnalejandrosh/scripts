@@ -16,15 +16,37 @@ Tiene **dos interfaces**, ambas sobre la misma lógica en `internal/`
 
 ## Requisitos
 
-- Go 1.26+
+- Go 1.26+ (`go version`) — el módulo declara `go 1.26.5`
 - AWS CLI v2 instalado y en el `PATH` (`aws --version`)
 
 ## Compilar y ejecutar (TUI)
+
+Desde la raíz del repo:
 
 ```sh
 go build -o scriptstui .
 ./scriptstui
 ```
+
+El binario `scriptstui` queda en la raíz y está en `.gitignore`, así que hay
+que recompilarlo cuando cambies `main.go` o algo en `internal/`. Para una
+corrida rápida sin dejar binario:
+
+```sh
+go run .
+```
+
+Otros comandos útiles (compilan/chequean también `desktop/`, sin generar
+binarios):
+
+```sh
+go build ./...
+go vet ./...
+```
+
+La app de escritorio se compila con otro comando (`wails`, no `go build`):
+ver [App de escritorio](#app-de-escritorio) al final y
+[desktop/README.md](desktop/README.md).
 
 ## Uso
 
@@ -152,8 +174,23 @@ legacy-sh/                    scripts .sh originales, solo de referencia
 
 Vive en [desktop/](desktop/) como un subpaquete de este mismo módulo Go (no
 tiene su propio `go.mod`, por eso puede importar `internal/...` tal cual) con
-un frontend propio en `desktop/frontend/`. Detalles de uso y desarrollo en
-[desktop/README.md](desktop/README.md).
+un frontend propio en `desktop/frontend/`.
+
+No se compila con `go build` sino con el CLI de Wails (que además construye el
+frontend y empaqueta el `.app`):
+
+```sh
+cd desktop
+wails build                                # compila y empaqueta
+open build/bin/scriptstui-desktop.app      # abrir (macOS)
+wails dev                                  # desarrollo, con recarga en caliente
+```
+
+Requiere Node.js + npm y el CLI de Wails instalados; los detalles (incluido el
+`PATH` de `wails` tras el `go install`) están en
+[desktop/README.md](desktop/README.md), que también explica cómo
+[empaquetarla para distribuirla](desktop/README.md#distribución) (build
+universal, DMG, firma y notarización).
 
 La TUI sigue siendo la interfaz de referencia: se documenta primero, se
 prueba primero, y cualquier funcionalidad nueva en `internal/` queda
