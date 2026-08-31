@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -31,6 +32,10 @@ type Step struct {
 	// immediately. Zero means don't wait/check (used for single-step, foreground
 	// SSM sessions where there is nothing to check against).
 	WaitAfterStartSeconds int
+	// LocalPort is the port the tunnel listens on locally, kept as a value so
+	// the UI and the store can read it without parsing the command line back.
+	// Zero on command steps.
+	LocalPort int
 	// Profile, when set, names an AWS CLI profile (see internal/ssologin)
 	// that this tunnel step must run as: `aws ... --profile <Profile>`.
 	// Left empty here — the TUI assigns it per session, from whatever SSO
@@ -51,13 +56,79 @@ type Service struct {
 // (line continuations and single-quoted --parameters JSON included).
 func tunnelStep(label, cmdline string, waitSeconds int) Step {
 	command, args := mustParseCmdline(cmdline)
+	raw := normalizeCmdline(cmdline)
+	port, _ := strconv.Atoi(localPortNumber(raw))
 	return Step{
 		Kind:                  StepTunnel,
 		Label:                 label,
 		Command:               command,
 		Args:                  args,
-		Raw:                   normalizeCmdline(cmdline),
+		Raw:                   raw,
+		LocalPort:             port,
 		WaitAfterStartSeconds: waitSeconds,
+	}
+}
+
+// TunnelParams are the pieces of an SSM port-forwarding session that the
+// tunnels table stores as columns. NewTunnelStep turns them into the same
+// Step the literals above produce, so nothing downstream can tell whether a
+// tunnel came from this file or from the database.
+type TunnelParams struct {
+	Label        string
+	Target       string
+	Host         string
+	RemotePort   int
+	LocalPort    int
+	Region       string
+	DocumentName string
+	WaitSeconds  int
+}
+
+// SSMPortForwardDocument is the SSM document that forwards a local port to a
+// host reachable from the target instance — the only one these tunnels use.
+const SSMPortForwardDocument = "AWS-StartPortForwardingSessionToRemoteHost"
+
+// NewTunnelStep builds a tunnel step from its parts instead of from a shell
+// literal, so a row in the database becomes a runnable step without going
+// through the command-line parser.
+func NewTunnelStep(p TunnelParams) Step {
+	label := p.Label
+	if label == "" {
+		label = "AWS"
+	}
+	doc := p.DocumentName
+	if doc == "" {
+		doc = SSMPortForwardDocument
+	}
+	parameters := fmt.Sprintf(
+		`{"host":["%s"],"portNumber":["%d"],"localPortNumber":["%d"]}`,
+		p.Host, p.RemotePort, p.LocalPort)
+
+	args := []string{
+		"ssm", "start-session",
+		"--target", p.Target,
+		"--document-name", doc,
+		"--parameters", parameters,
+		"--region", p.Region,
+	}
+
+	// Raw is the single-line, shell-quoted form, matching what
+	// normalizeCmdline produces for the literals: it is what gets displayed
+	// and copied, so the JSON has to stay quoted as one argument.
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, "aws")
+	for _, a := range args {
+		parts = append(parts, shellQuote(a))
+	}
+
+	return Step{
+		Kind:                  StepTunnel,
+		Label:                 label,
+		Command:               "aws",
+		Args:                  args,
+		Raw:                   strings.Join(parts, " "),
+		LocalPort:             p.LocalPort,
+		WaitAfterStartSeconds: p.WaitSeconds,
 	}
 }
 
@@ -187,8 +258,12 @@ func shellQuote(token string) string {
 	return "'" + strings.ReplaceAll(token, "'", `'\''`) + "'"
 }
 
-// Services is the fixed list of environments this tool can start/stop.
-// Only tunnels for now; appbi/map/simae (backend+frontend) are on hold.
+// Services is the seed for a brand-new database: the tunnels this tool
+// shipped with before they moved into internal/store. It runs once, when
+// scriptstui.db has no rows; from then on the tunnels live in the database
+// and are managed from the UI ('n' new, 'e' edit, 'D' delete), so editing
+// this list no longer changes what a populated install shows.
+//
 // None of these hardcode an AWS profile — assign one per tunnel from the
 // TUI's accounts panel ('a' to browse/login, 'p' on a tunnel to assign).
 func Services() []Service {
@@ -260,4 +335,73 @@ func Services() []Service {
 			},
 		},
 	}
+}
+
+// LocalPort returns the local port this service's tunnel listens on, as text
+// ready to print. Empty when the service has no tunnel step.
+func (s Service) LocalPort() string {
+	for _, step := range s.Steps {
+		if step.Kind == StepTunnel && step.LocalPort > 0 {
+			return strconv.Itoa(step.LocalPort)
+		}
+	}
+	return ""
+}
+
+// localPortNumber pulls NNNN out of `"localPortNumber":["NNNN"]`.
+func localPortNumber(cmdline string) string {
+	return jsonArrayValue(cmdline, "localPortNumber")
+}
+
+// jsonArrayValue pulls V out of `"key":["V"]`. The --parameters payload is
+// always written without spaces inside the JSON — both in the literals below
+// and in NewTunnelStep — so a plain substring scan is enough, no JSON parsing.
+func jsonArrayValue(s, key string) string {
+	k := `"` + key + `":["`
+	i := strings.Index(s, k)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(k):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// TunnelParamsOf reads the port-forwarding parameters back out of a tunnel
+// step's arguments. It is how the literals in this file get seeded into the
+// database as columns; it reports false for anything that isn't a
+// port-forwarding session.
+func TunnelParamsOf(s Step) (TunnelParams, bool) {
+	if s.Kind != StepTunnel {
+		return TunnelParams{}, false
+	}
+
+	flags := make(map[string]string, 4)
+	for i := 0; i+1 < len(s.Args); i++ {
+		if strings.HasPrefix(s.Args[i], "--") {
+			flags[s.Args[i]] = s.Args[i+1]
+		}
+	}
+
+	params := flags["--parameters"]
+	host := jsonArrayValue(params, "host")
+	remote, errRemote := strconv.Atoi(jsonArrayValue(params, "portNumber"))
+	local, errLocal := strconv.Atoi(jsonArrayValue(params, "localPortNumber"))
+	if host == "" || errRemote != nil || errLocal != nil || flags["--target"] == "" {
+		return TunnelParams{}, false
+	}
+
+	return TunnelParams{
+		Label:        s.Label,
+		Target:       flags["--target"],
+		Host:         host,
+		RemotePort:   remote,
+		LocalPort:    local,
+		Region:       flags["--region"],
+		DocumentName: flags["--document-name"],
+		WaitSeconds:  s.WaitAfterStartSeconds,
+	}, true
 }

@@ -6,10 +6,14 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -20,9 +24,9 @@ import (
 	"scriptstui/internal/awscreds"
 	"scriptstui/internal/clipboard"
 	"scriptstui/internal/config"
-	"scriptstui/internal/prefs"
 	"scriptstui/internal/procman"
 	"scriptstui/internal/ssologin"
+	"scriptstui/internal/store"
 )
 
 const maxLogLines = 2000
@@ -33,8 +37,22 @@ const maxLogLines = 2000
 // front end (see desktop/app.go) via ssologin.DeviceCodePattern.
 var ssoDeviceCodePattern = ssologin.DeviceCodePattern
 
-const listWidth = 66
+// logBoxChrome is what logBoxStyle costs around its contents: a border on
+// each side plus one column of padding on each side.
+const logBoxChrome = 4
+
+// baseListWidth is the tunnel panel's width without the proyecto column.
+const baseListWidth = 74
 const titleFieldWidth = 34
+
+// projectColumnWidth is how much the panel grows once tunnels start carrying
+// a proyecto; it stays hidden while every proyecto is empty.
+const projectColumnWidth = 12
+
+// portFieldWidth reserves room for the "[NNNNN]" local-port field shown
+// between a tunnel's title and its status, so the statuses stay aligned
+// whether or not a service has a port.
+const portFieldWidth = 7
 
 // maxImportWarnings caps how many per-account problems an import prints
 // before collapsing the rest into a count, so one broken account can't push
@@ -66,6 +84,8 @@ const (
 	modeSSO
 	modeAssignProfile
 	modeNewProfile
+	modeTunnelForm
+	modeTunnelDelete
 )
 
 var (
@@ -103,6 +123,7 @@ var (
 	itemDimStyle  = lipgloss.NewStyle().Foreground(colorMuted)
 	selectedTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
 	checkedStyle  = lipgloss.NewStyle().Bold(true).Foreground(colorMarked)
+	portStyle     = lipgloss.NewStyle().Foreground(colorMarked)
 
 	helpStyle    = lipgloss.NewStyle().Foreground(colorMuted)
 	helpKeyStyle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
@@ -147,8 +168,39 @@ func padTrunc(s string, w int) string {
 	return s + strings.Repeat(" ", w-len(r))
 }
 
+// projectFieldWidth returns the width the proyecto column needs: zero until
+// at least one tunnel has one, so a freshly seeded list looks exactly as it
+// did before the column existed.
+func (m Model) projectFieldWidth() int {
+	for _, s := range m.services {
+		if strings.TrimSpace(s.row.Proyecto) != "" {
+			return projectColumnWidth
+		}
+	}
+	return 0
+}
+
+// listWidth is the tunnel panel's width, grown to fit the proyecto column
+// when it is in use.
+func (m Model) listWidth() int {
+	if w := m.projectFieldWidth(); w > 0 {
+		return baseListWidth + w + 1
+	}
+	return baseListWidth
+}
+
 func helpEntry(key, desc string) string {
 	return helpKeyStyle.Render(key) + " " + helpStyle.Render(desc)
+}
+
+// connectionStringFor returns the tunnel's stored connection string for the
+// running OS plus the name of the column it came from. Anything that isn't
+// Windows reads the mac column, since the POSIX form works there too.
+func connectionStringFor(row store.Tunnel) (value, column string) {
+	if runtime.GOOS == "windows" {
+		return row.ConnStringWin, "windows"
+	}
+	return row.ConnStringMac, "mac"
 }
 
 // withProfile returns a copy of svc with every tunnel step set to run as
@@ -167,7 +219,10 @@ func withProfile(svc config.Service, profile string) config.Service {
 }
 
 type serviceState struct {
-	cfg       config.Service
+	cfg config.Service
+	// row is the tunnels row this service was built from, kept so the edit
+	// form can be prefilled and so the list can tell a disabled tunnel apart.
+	row       store.Tunnel
 	status    procman.Status
 	logs      []string
 	startedAt time.Time
@@ -457,20 +512,35 @@ type Model struct {
 	index    map[string]int
 	cursor   int
 	marked   map[string]bool
-	// tunnelProfile maps service ID -> AWS CLI profile name. Loaded from the
-	// prefs file at startup and written back on every change, so an assignment
-	// survives restarts instead of having to be picked again each session.
+	// store is where the tunnels live; every create/edit/delete goes through
+	// it and the list is rebuilt from it afterwards.
+	store *store.Store
+	// tunnelProfile maps service ID -> AWS CLI profile name, mirroring the
+	// profile column so the header and the command view can read it cheaply.
 	tunnelProfile map[string]string
-	prefsErr      string // last failure writing the prefs file, shown in the UI
+	storeErr      string // last failure talking to the database, shown in the UI
 
 	viewport viewport.Model
 	ready    bool
 	// commandBlock is the selected tunnel's command line, already wrapped and
 	// height-budgeted by layout() so the view just prints it.
 	commandBlock string
-	width        int
-	height       int
-	listHeight   int
+	// connBlock is the selected tunnel's stored connection string for this
+	// OS, rendered separately from commandBlock so a short terminal truncates
+	// the long aws command rather than the one line most worth copying.
+	connBlock string
+	// logPanelWidth is the log panel's outer width. Its contents are laid out
+	// at viewport.Width, which is narrower by the box's borders and padding —
+	// measuring at the outer width made every wrapped line come out one row
+	// short of what the box actually drew.
+	logPanelWidth int
+	// logPrefix is everything the log panel draws above the logs — header,
+	// command and connection line — already wrapped and trimmed to fit, so
+	// the view just prints it.
+	logPrefix  string
+	width      int
+	height     int
+	listHeight int
 
 	mode          mode
 	credsInput    textarea.Model
@@ -505,6 +575,10 @@ type Model struct {
 	copyStatusUntil time.Time
 
 	np *newProfileWizard
+	tf *tunnelForm
+
+	// deleteTarget is the id awaiting confirmation in modeTunnelDelete.
+	deleteTarget string
 
 	showHelp    bool
 	showAllLogs bool
@@ -512,22 +586,71 @@ type Model struct {
 	quitting bool
 }
 
-func NewModel(services []config.Service, mgr *procman.Manager) Model {
-	states := make([]*serviceState, len(services))
-	index := make(map[string]int, len(services))
-	for i, s := range services {
-		states[i] = &serviceState{cfg: s, status: procman.StatusStopped}
-		index[s.ID] = i
-	}
-	return Model{
+// NewModel builds the UI over st, reading the tunnel list from it. A failure
+// here is fatal for the caller: without the database there is nothing to show.
+func NewModel(st *store.Store, mgr *procman.Manager) (Model, error) {
+	m := Model{
 		mgr:           mgr,
-		services:      states,
-		index:         index,
+		store:         st,
+		index:         make(map[string]int),
 		marked:        make(map[string]bool),
-		tunnelProfile: prefs.LoadTunnelProfiles(),
+		tunnelProfile: make(map[string]string),
 		ssoStatus:     make(map[string]bool),
 		ssoExpiry:     make(map[string]time.Time),
 	}
+	if err := m.reloadTunnels(); err != nil {
+		return Model{}, err
+	}
+	return m, nil
+}
+
+// reloadTunnels rebuilds the list from the database, carrying over the status
+// and logs of every tunnel that is still there — editing one tunnel must not
+// wipe the output of another that is running.
+func (m *Model) reloadTunnels() error {
+	rows, err := m.store.List()
+	if err != nil {
+		return err
+	}
+
+	previous := make(map[string]*serviceState, len(m.services))
+	for _, s := range m.services {
+		previous[s.cfg.ID] = s
+	}
+
+	states := make([]*serviceState, len(rows))
+	index := make(map[string]int, len(rows))
+	profiles := make(map[string]string, len(rows))
+	for i, r := range rows {
+		st := &serviceState{cfg: r.Service(), row: r, status: procman.StatusStopped}
+		if prev, ok := previous[r.ID]; ok {
+			st.status, st.logs, st.startedAt = prev.status, prev.logs, prev.startedAt
+		}
+		states[i] = st
+		index[r.ID] = i
+		if r.Profile != "" {
+			profiles[r.ID] = r.Profile
+		}
+	}
+
+	m.services = states
+	m.index = index
+	m.tunnelProfile = profiles
+
+	// A delete can leave the cursor past the end, and marks pointing at
+	// tunnels that no longer exist.
+	if m.cursor >= len(states) {
+		m.cursor = len(states) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	for id := range m.marked {
+		if _, ok := index[id]; !ok {
+			delete(m.marked, id)
+		}
+	}
+	return nil
 }
 
 func waitForEvent(events <-chan procman.Event) tea.Cmd {
@@ -540,7 +663,12 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(waitForEvent(m.mgr.Events()), tick(), refreshSSOCmd())
 }
 
+// selected returns the highlighted tunnel, or nil when there are none left —
+// the list starts empty on a fresh database and can be emptied by deleting.
 func (m *Model) selected() *serviceState {
+	if m.cursor < 0 || m.cursor >= len(m.services) {
+		return nil
+	}
 	return m.services[m.cursor]
 }
 
@@ -548,7 +676,11 @@ func (m *Model) selected() *serviceState {
 // nothing is marked.
 func (m *Model) targets() []string {
 	if len(m.marked) == 0 {
-		return []string{m.selected().cfg.ID}
+		sel := m.selected()
+		if sel == nil {
+			return nil
+		}
+		return []string{sel.cfg.ID}
 	}
 	ids := make([]string, 0, len(m.marked))
 	for id := range m.marked {
@@ -576,6 +708,11 @@ func (m *Model) startServices(ids []string) {
 			continue
 		}
 		s := m.services[i]
+		if !s.row.Enabled {
+			// A tunnel turned off has given up its port; starting it would
+			// contradict what the list shows.
+			continue
+		}
 		if s.status == procman.StatusRunning || s.status == procman.StatusStarting {
 			continue
 		}
@@ -606,6 +743,10 @@ func (m *Model) refreshViewportContent() {
 		return
 	}
 	s := m.selected()
+	if s == nil {
+		m.viewport.SetContent("")
+		return
+	}
 	m.viewport.SetContent(strings.Join(s.logs, "\n"))
 	m.viewport.GotoBottom()
 }
@@ -616,13 +757,18 @@ func (m *Model) refreshViewportContent() {
 // the hint is long enough to wrap on narrower terminals.
 func (m Model) logHeader(width int) string {
 	sel := m.selected()
+	if sel == nil {
+		return lipgloss.NewStyle().Width(width).Render(
+			logHeaderStyle.Render("Sin túneles") + "  " +
+				itemDimStyle.Render("(n para crear el primero)"))
+	}
 
 	profileInfo := "sin perfil asignado"
 	if p := m.tunnelProfile[sel.cfg.ID]; p != "" {
 		profileInfo = "perfil: " + p
 	}
 
-	hint := itemDimStyle.Render("(" + profileInfo + " · p cambiar perfil · y copiar comando)")
+	hint := itemDimStyle.Render("(" + profileInfo + " · p perfil · y copiar comando · C copiar conexión)")
 	if m.copyStatus != "" {
 		style := lipgloss.NewStyle().Bold(true).Foreground(colorRunning)
 		if strings.HasPrefix(m.copyStatus, "✗") {
@@ -632,6 +778,9 @@ func (m Model) logHeader(width int) string {
 	}
 
 	line := logHeaderStyle.Render("Logs — "+sel.cfg.Title) + "  " + hint
+	if m.storeErr != "" {
+		line += "  " + modalErrStyle.Render(m.storeErr)
+	}
 	return lipgloss.NewStyle().Width(width).Render(line)
 }
 
@@ -655,6 +804,9 @@ func (m Model) commandFor(s *serviceState) string {
 // assigned profile is spliced in, so what is shown is what will actually run.
 func (m Model) commandView(width int) string {
 	sel := m.selected()
+	if sel == nil {
+		return ""
+	}
 	profile := m.tunnelProfile[sel.cfg.ID]
 	style := lipgloss.NewStyle().Foreground(colorMuted)
 
@@ -666,6 +818,33 @@ func (m Model) commandView(width int) string {
 		blocks = append(blocks, style.Render(formatCommand(step.CommandLine(), width)))
 	}
 	return strings.Join(blocks, "\n")
+}
+
+// connectionView renders the stored connection string for this OS, or a hint
+// pointing at the editor when the tunnel doesn't have one yet.
+func (m Model) connectionView(width int) string {
+	sel := m.selected()
+	if sel == nil {
+		return ""
+	}
+	conn, column := connectionStringFor(sel.row)
+	label := "conexión (" + column + ")  "
+
+	// Always one row: this line exists to identify the string, not to read it
+	// off the panel — 'C' is what puts it on the clipboard — and letting a
+	// long DSN wrap would eat three rows of logs.
+	// Whatever is left after the label — never padded back up, since a line
+	// wider than the panel wraps onto a second row and costs the box its
+	// bottom border. On a panel too narrow even for the label, the label
+	// itself is what gets cut.
+	room := width - utf8.RuneCountInString(label)
+	if room < 1 {
+		return labelStyle.Render(padTrunc(label, width))
+	}
+	if conn == "" {
+		return labelStyle.Render(label) + itemDimStyle.Render(padTrunc("sin definir · 'e' para agregarla", room))
+	}
+	return labelStyle.Render(label) + itemStyle.Render(padTrunc(conn, room))
 }
 
 // formatCommand lays a one-line command out as the multi-line, backslash-
@@ -742,7 +921,13 @@ func (m *Model) layout() {
 	if bodyHeight < 5 {
 		bodyHeight = 5
 	}
-	logWidth := m.width - listWidth - 6
+	// logPanelWidth is the box; logWidth is what fits inside it, once its two
+	// borders and two columns of padding are taken out.
+	m.logPanelWidth = m.width - m.listWidth() - 6
+	if m.logPanelWidth < 24 {
+		m.logPanelWidth = 24
+	}
+	logWidth := m.logPanelWidth - logBoxChrome
 	if logWidth < 20 {
 		logWidth = 20
 	}
@@ -757,8 +942,15 @@ func (m *Model) layout() {
 	if available < 2 {
 		available = 2
 	}
+	m.connBlock = m.connectionView(logWidth)
+	connHeight := 0
+	if m.connBlock != "" {
+		connHeight = lipgloss.Height(m.connBlock)
+	}
+
+	// Trim the command first, since it is the tallest and least urgent part.
 	m.commandBlock = m.commandView(logWidth)
-	maxCommandHeight := available - 4 // blank separator + 3 rows of logs
+	maxCommandHeight := available - 4 - connHeight // blank separator + 3 rows of logs
 	if maxCommandHeight < 1 {
 		maxCommandHeight = 1
 	}
@@ -766,7 +958,26 @@ func (m *Model) layout() {
 		m.commandBlock = strings.Join(append(lines[:maxCommandHeight-1], itemDimStyle.Render("  …")), "\n")
 	}
 
-	logViewportHeight := available - lipgloss.Height(m.commandBlock) - 1
+	// Assemble everything above the logs and measure that, rather than adding
+	// up its parts: the header, the command and the connection line all wrap,
+	// and an arithmetic estimate drifts by a row. Anything past what the box
+	// can hold is cut here — letting it overflow costs the panel its bottom
+	// border, since lipgloss clips the excess.
+	// Wrapped to the panel's real width before being measured: formatCommand
+	// emits an over-long line whenever a single token (the --parameters JSON,
+	// a long instance id) doesn't fit, and the box would re-wrap it into rows
+	// this measurement never saw.
+	m.logPrefix = lipgloss.NewStyle().Width(logWidth).Render(
+		m.logHeader(logWidth) + "\n" + m.commandBlock + "\n" + m.connBlock)
+	maxPrefix := m.listHeight - 2 // blank separator + one row of logs
+	if maxPrefix < 1 {
+		maxPrefix = 1
+	}
+	if lines := strings.Split(m.logPrefix, "\n"); len(lines) > maxPrefix {
+		m.logPrefix = strings.Join(append(lines[:maxPrefix-1], itemDimStyle.Render("…")), "\n")
+	}
+
+	logViewportHeight := m.listHeight - lipgloss.Height(m.logPrefix) - 1
 	if logViewportHeight < 1 {
 		logViewportHeight = 1
 	}
@@ -806,6 +1017,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateAssignProfile(msg)
 		case modeNewProfile:
 			return m.updateNewProfile(msg)
+		case modeTunnelForm:
+			return m.updateTunnelForm(msg)
+		case modeTunnelDelete:
+			return m.updateTunnelDelete(msg)
 		default:
 			return m.updateList(msg)
 		}
@@ -1091,8 +1306,34 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.layout()
 		}
 		return m, nil
+	case "n":
+		var focusCmd tea.Cmd
+		m.tf, focusCmd = newTunnelForm(store.Tunnel{}, false, m.width)
+		m.mode = modeTunnelForm
+		return m, focusCmd
+	case "e":
+		sel := m.selected()
+		if sel == nil {
+			return m, nil
+		}
+		var focusCmd tea.Cmd
+		m.tf, focusCmd = newTunnelForm(sel.row, true, m.width)
+		m.mode = modeTunnelForm
+		return m, focusCmd
+	case "D":
+		sel := m.selected()
+		if sel == nil {
+			return m, nil
+		}
+		m.deleteTarget = sel.cfg.ID
+		m.mode = modeTunnelDelete
+		return m, nil
 	case " ":
-		id := m.selected().cfg.ID
+		sel := m.selected()
+		if sel == nil {
+			return m, nil
+		}
+		id := sel.cfg.ID
 		if m.marked[id] {
 			delete(m.marked, id)
 		} else {
@@ -1111,7 +1352,11 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeSSO
 		return m, refreshSSOCmd()
 	case "p":
-		m.assignTarget = m.selected().cfg.ID
+		sel := m.selected()
+		if sel == nil {
+			return m, nil
+		}
+		m.assignTarget = sel.cfg.ID
 		m.assignCursor = 0
 		if cur := m.tunnelProfile[m.assignTarget]; cur != "" {
 			for i, p := range m.discoveredProfiles {
@@ -1124,12 +1369,34 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeAssignProfile
 		return m, nil
 	case "y":
+		sel := m.selected()
+		if sel == nil {
+			return m, nil
+		}
 		// Copy the single-line form: it pastes cleanly into any shell,
 		// unlike the wrapped, backslash-continued one on screen.
-		if err := clipboard.Copy(m.commandFor(m.selected())); err != nil {
+		if err := clipboard.Copy(m.commandFor(sel)); err != nil {
 			m.copyStatus = "✗ no se pudo copiar: " + err.Error()
 		} else {
 			m.copyStatus = "✓ comando copiado al portapapeles"
+		}
+		m.copyStatusUntil = time.Now().Add(4 * time.Second)
+		m.layout()
+		return m, nil
+	case "C":
+		// Both panels share every screen row, so a mouse drag always picks up
+		// the tunnel list too; this is the way to get the string out clean.
+		sel := m.selected()
+		if sel == nil {
+			return m, nil
+		}
+		conn, column := connectionStringFor(sel.row)
+		if conn == "" {
+			m.copyStatus = "✗ sin cadena de conexión para " + column + " · 'e' para agregarla"
+		} else if err := clipboard.Copy(conn); err != nil {
+			m.copyStatus = "✗ no se pudo copiar: " + err.Error()
+		} else {
+			m.copyStatus = "✓ cadena de conexión copiada"
 		}
 		m.copyStatusUntil = time.Now().Add(4 * time.Second)
 		m.layout()
@@ -1289,14 +1556,15 @@ func (m Model) updateAssignProfile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ssoRefreshing = true
 		return m, refreshSSOCmd()
 	case "enter":
-		if m.assignCursor == 0 {
-			delete(m.tunnelProfile, m.assignTarget)
-		} else {
-			m.tunnelProfile[m.assignTarget] = m.discoveredProfiles[m.assignCursor-1].Name
+		profile := ""
+		if m.assignCursor > 0 {
+			profile = m.discoveredProfiles[m.assignCursor-1].Name
 		}
-		m.prefsErr = ""
-		if err := prefs.SaveTunnelProfiles(m.tunnelProfile); err != nil {
-			m.prefsErr = "no se pudo guardar el perfil: " + err.Error()
+		m.storeErr = ""
+		if err := m.store.SetProfile(m.assignTarget, profile); err != nil {
+			m.storeErr = "no se pudo guardar el perfil: " + err.Error()
+		} else if err := m.reloadTunnels(); err != nil {
+			m.storeErr = "no se pudo recargar: " + err.Error()
 		}
 		m.layout()
 		m.mode = modeList
@@ -1477,6 +1745,10 @@ func (m Model) View() string {
 		return m.viewAssignProfile()
 	case modeNewProfile:
 		return m.viewNewProfile()
+	case modeTunnelForm:
+		return m.viewTunnelForm()
+	case modeTunnelDelete:
+		return m.viewTunnelDelete()
 	default:
 		return m.viewList()
 	}
@@ -1485,10 +1757,22 @@ func (m Model) View() string {
 func (m Model) viewList() string {
 	header := titleStyle.Render("scriptstui — gestor de túneles")
 
+	projectWidth := m.projectFieldWidth()
+
 	var list strings.Builder
+	if len(m.services) == 0 {
+		list.WriteString(itemDimStyle.Render("  No hay túneles todavía."))
+		list.WriteString("\n\n")
+		list.WriteString("  " + helpEntry("n", "crear el primero"))
+		list.WriteString("\n")
+	}
 	for i, s := range m.services {
 		cursorMark := "  "
-		titleRendered := itemStyle.Render(padTrunc(s.cfg.Title, titleFieldWidth))
+		titleStyleFor := itemStyle
+		if !s.row.Enabled {
+			titleStyleFor = itemDimStyle
+		}
+		titleRendered := titleStyleFor.Render(padTrunc(s.cfg.Title, titleFieldWidth))
 		if i == m.cursor {
 			cursorMark = cursorStyle.Render("▶ ")
 			titleRendered = selectedTitle.Render(padTrunc(s.cfg.Title, titleFieldWidth))
@@ -1498,34 +1782,53 @@ func (m Model) viewList() string {
 			selMark = checkedStyle.Render("✓")
 		}
 
+		projectRendered := ""
+		if projectWidth > 0 {
+			projectRendered = itemDimStyle.Render(padTrunc(s.row.Proyecto, projectWidth)) + " "
+		}
+
+		portText := ""
+		if port := s.cfg.LocalPort(); port != "" {
+			portText = "[" + port + "]"
+		}
+		portRendered := portStyle.Render(padTrunc(portText, portFieldWidth))
+
+		// A disabled tunnel can't be started, so it reports that instead of a
+		// run status that would never change.
 		statusText := s.status.String()
-		if s.status == procman.StatusRunning && !s.startedAt.IsZero() {
+		statusFg := statusColor(s.status)
+		dot := statusDot(s.status)
+		if !s.row.Enabled {
+			statusText = "desactivado"
+			statusFg = colorStopped
+			dot = lipgloss.NewStyle().Foreground(colorStopped).Render("○")
+			portRendered = itemDimStyle.Render(padTrunc(portText, portFieldWidth))
+		} else if s.status == procman.StatusRunning && !s.startedAt.IsZero() {
 			statusText += " · " + time.Since(s.startedAt).Round(time.Second).String()
 		}
-		statusRendered := lipgloss.NewStyle().Foreground(statusColor(s.status)).Render(statusText)
+		statusRendered := lipgloss.NewStyle().Foreground(statusFg).Render(statusText)
 
-		line := cursorMark + selMark + " " + statusDot(s.status) + " " + titleRendered + "  " + statusRendered
+		line := cursorMark + selMark + " " + dot + " " + projectRendered + titleRendered + "  " + portRendered + " " + statusRendered
 		list.WriteString(line)
 		list.WriteString("\n")
 	}
-	listPanel := listBoxStyle.Width(listWidth).Height(m.listHeight).Render(list.String())
+	listPanel := listBoxStyle.Width(m.listWidth()).Height(m.listHeight).Render(list.String())
 
-	logHeader := m.logHeader(m.viewport.Width)
-	if m.prefsErr != "" {
-		logHeader += "  " + modalErrStyle.Render(m.prefsErr)
-	}
 	logPanel := logBoxStyle.
-		Width(m.viewport.Width).
+		Width(m.logPanelWidth).
 		Height(m.listHeight).
 		MaxHeight(m.listHeight + 2). // + top and bottom border
-		Render(logHeader + "\n" + m.commandBlock + "\n\n" + m.viewport.View())
+		Render(m.logPrefix + "\n\n" + m.viewport.View())
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listPanel, logPanel)
 
 	help := helpEntry("enter/s", "iniciar") + "  " +
 		helpEntry("x", "detener") + "  " +
-		helpEntry("y", "copiar") + "  " +
-		helpEntry("v", "todos los logs") + "  " +
+		helpEntry("n", "nuevo") + "  " +
+		helpEntry("e", "editar") + "  " +
+		helpEntry("D", "eliminar") + "  " +
+		helpEntry("y", "comando") + "  " +
+		helpEntry("C", "conexión") + "  " +
 		helpEntry("a", "cuentas AWS") + "  " +
 		helpEntry("?", "ayuda") + "  " +
 		helpEntry("q", "salir")
@@ -1584,8 +1887,17 @@ func (m Model) viewHelp() string {
 	b.WriteString(helpEntry("espacio", "marcar varios túneles para iniciarlos/detenerlos juntos") + "\n")
 	b.WriteString(helpEntry("p", "elegir el perfil AWS del túnel resaltado") + "\n")
 	b.WriteString(helpEntry("y", "copiar al portapapeles el comando aws ssm del túnel resaltado") + "\n")
+	b.WriteString(helpEntry("C", "copiar la cadena de conexión del túnel resaltado (mac o windows según el SO)") + "\n")
 	b.WriteString(helpEntry("v", "ver los logs de los 3 túneles a la vez") + "\n")
 	b.WriteString(helpEntry("pgup/pgdn", "scroll de los logs") + "\n")
+
+	b.WriteString("\n")
+	b.WriteString(itemDimStyle.Render("Administrar túneles (se guardan en " + store.FileName + ")"))
+	b.WriteString("\n")
+	b.WriteString(helpEntry("n", "crear un túnel nuevo") + "\n")
+	b.WriteString(helpEntry("e", "editar el túnel resaltado") + "\n")
+	b.WriteString(helpEntry("D", "eliminar el túnel resaltado (pide confirmación)") + "\n")
+	b.WriteString(helpEntry("ctrl+s", "guardar, dentro del formulario") + "\n")
 
 	b.WriteString("\n")
 	b.WriteString(itemDimStyle.Render("Credenciales AWS"))
@@ -1768,9 +2080,9 @@ func (m Model) viewSSO() string {
 	if end < len(m.discoveredProfiles) {
 		list.WriteString(itemDimStyle.Render(fmt.Sprintf("  ↓ %d perfiles más abajo", len(m.discoveredProfiles)-end)) + "\n")
 	}
-	listPanel := listBoxStyle.Width(listWidth).Height(m.listHeight).Render(list.String())
+	listPanel := listBoxStyle.Width(baseListWidth).Height(m.listHeight).Render(list.String())
 
-	logWidth := m.width - listWidth - 6
+	logWidth := m.width - baseListWidth - 6
 	if logWidth < 20 {
 		logWidth = 20
 	}
@@ -1903,6 +2215,365 @@ func (m Model) viewNewProfile() string {
 		b.WriteString("\n")
 		b.WriteString(helpEntry("↑/↓", "navegar") + "  " + helpEntry("enter", "elegir") + "  " + helpEntry("esc", "cancelar"))
 	}
+
+	box := modalBoxStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// --- Tunnel CRUD form: one modal shared by "new" and "edit" ---------------
+
+// The fields of the tunnel form, in tab order. tfEnabled is a toggle rather
+// than a text input, so it has no entry in tunnelForm.inputs.
+const (
+	tfID = iota
+	tfProyecto
+	tfTitle
+	tfTarget
+	tfHost
+	tfRemotePort
+	tfLocalPort
+	tfRegion
+	tfDocument
+	tfConnMac
+	tfConnWin
+	tfInputCount // number of text inputs
+	tfEnabled    = tfInputCount
+	tfFieldCount = tfInputCount + 1
+)
+
+var tunnelFormLabels = [tfInputCount]string{
+	tfID:         "id",
+	tfProyecto:   "proyecto",
+	tfTitle:      "nombre",
+	tfTarget:     "target (EC2)",
+	tfHost:       "host remoto",
+	tfRemotePort: "puerto remoto",
+	tfLocalPort:  "puerto local",
+	tfRegion:     "región",
+	tfDocument:   "documento SSM",
+	tfConnMac:    "conn. string mac",
+	tfConnWin:    "conn. string win",
+}
+
+var tunnelFormPlaceholders = [tfInputCount]string{
+	tfID:         "db-balu",
+	tfProyecto:   "BALU",
+	tfTitle:      "Túnel DB BALU PROD",
+	tfTarget:     "i-074e88b2ee9d1d67f",
+	tfHost:       "mi-db.cluster-abc.us-east-1.rds.amazonaws.com",
+	tfRemotePort: "5432",
+	tfLocalPort:  "5437",
+	tfRegion:     "us-east-1",
+	tfDocument:   config.SSMPortForwardDocument,
+	tfConnMac:    "psql postgres://usuario@localhost:5437/mi_db",
+	tfConnWin:    "psql postgresql://usuario@127.0.0.1:5437/mi_db",
+}
+
+type tunnelForm struct {
+	inputs [tfInputCount]textinput.Model
+	focus  int
+	// editing is false for a new tunnel. When true the id is fixed: it is the
+	// key procman and the marks are stored under, so renaming it would have to
+	// be a delete plus an insert rather than an update.
+	editing bool
+	enabled bool
+	err     string
+}
+
+// labelPrompt pads every label to the same width so the input boxes line up.
+// The padding counts runes, not bytes: "región" is one rune shorter than its
+// byte length and would otherwise sit a column off from the rest.
+func labelPrompt(label string) string {
+	const w = 18
+	n := utf8.RuneCountInString(label)
+	if n >= w {
+		return label + ": "
+	}
+	return label + ":" + strings.Repeat(" ", w-n) + " "
+}
+
+// newTunnelForm builds the form, prefilled from row when editing.
+func newTunnelForm(row store.Tunnel, editing bool, width int) (*tunnelForm, tea.Cmd) {
+	w := width - 34
+	if w > 60 {
+		w = 60
+	}
+	if w < 24 {
+		w = 24
+	}
+
+	f := &tunnelForm{editing: editing, enabled: true}
+	values := [tfInputCount]string{}
+	if editing {
+		f.enabled = row.Enabled
+		values = [tfInputCount]string{
+			tfID:         row.ID,
+			tfProyecto:   row.Proyecto,
+			tfTitle:      row.Title,
+			tfTarget:     row.Target,
+			tfHost:       row.Host,
+			tfRemotePort: strconv.Itoa(row.RemotePort),
+			tfLocalPort:  strconv.Itoa(row.LocalPort),
+			tfRegion:     row.Region,
+			tfDocument:   row.DocumentName,
+			tfConnMac:    row.ConnStringMac,
+			tfConnWin:    row.ConnStringWin,
+		}
+	} else {
+		// Sensible defaults so a new tunnel only needs the parts that differ.
+		values[tfRegion] = "us-east-1"
+		values[tfDocument] = config.SSMPortForwardDocument
+	}
+
+	for i := 0; i < tfInputCount; i++ {
+		in := textinput.New()
+		in.Prompt = labelPrompt(tunnelFormLabels[i])
+		in.Placeholder = tunnelFormPlaceholders[i]
+		in.CharLimit = 300
+		in.Width = w
+		in.SetValue(values[i])
+		f.inputs[i] = in
+	}
+
+	f.focus = f.firstFocusable()
+	return f, f.inputs[f.focus].Focus()
+}
+
+// firstFocusable skips the id when editing, since it can't be changed there.
+func (f *tunnelForm) firstFocusable() int {
+	if f.editing {
+		return tfProyecto
+	}
+	return tfID
+}
+
+// focusable reports whether a field can take the cursor.
+func (f *tunnelForm) focusable(i int) bool {
+	return !(f.editing && i == tfID)
+}
+
+// move walks the focus by delta, wrapping around and skipping fixed fields.
+func (f *tunnelForm) move(delta int) tea.Cmd {
+	for i := 0; i < tfInputCount; i++ {
+		f.inputs[i].Blur()
+	}
+	next := f.focus
+	for {
+		next = (next + delta + tfFieldCount) % tfFieldCount
+		if f.focusable(next) {
+			break
+		}
+	}
+	f.focus = next
+	if f.focus < tfInputCount {
+		return f.inputs[f.focus].Focus()
+	}
+	return nil
+}
+
+// tunnel assembles the row the form describes, reporting the first field the
+// user has to fix.
+func (f *tunnelForm) tunnel(sortOrder int) (store.Tunnel, error) {
+	value := func(i int) string { return strings.TrimSpace(f.inputs[i].Value()) }
+
+	remote, err := strconv.Atoi(value(tfRemotePort))
+	if err != nil {
+		return store.Tunnel{}, errors.New("el puerto remoto debe ser un número (ej. 5432)")
+	}
+	local, err := strconv.Atoi(value(tfLocalPort))
+	if err != nil {
+		return store.Tunnel{}, errors.New("el puerto local debe ser un número (ej. 5437)")
+	}
+
+	t := store.Tunnel{
+		ID:            value(tfID),
+		Proyecto:      value(tfProyecto),
+		Title:         value(tfTitle),
+		Target:        value(tfTarget),
+		Host:          value(tfHost),
+		RemotePort:    remote,
+		LocalPort:     local,
+		Region:        value(tfRegion),
+		DocumentName:  value(tfDocument),
+		ConnStringMac: value(tfConnMac),
+		ConnStringWin: value(tfConnWin),
+		Enabled:       f.enabled,
+		SortOrder:     sortOrder,
+	}
+	return t, t.Validate()
+}
+
+func (m Model) updateTunnelForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.tf == nil {
+		m.mode = modeList
+		return m, nil
+	}
+
+	save := func(m Model) (tea.Model, tea.Cmd) {
+		// A new tunnel goes to the end of the list; an edited one keeps the
+		// place (and the profile) it already had.
+		sortOrder, profile := 0, ""
+		if m.tf.editing {
+			if i, ok := m.index[strings.TrimSpace(m.tf.inputs[tfID].Value())]; ok {
+				sortOrder = m.services[i].row.SortOrder
+				profile = m.services[i].row.Profile
+			}
+		}
+		row, err := m.tf.tunnel(sortOrder)
+		if err != nil {
+			m.tf.err = err.Error()
+			return m, nil
+		}
+		row.Profile = profile
+
+		if m.tf.editing {
+			err = m.store.Update(row)
+		} else {
+			err = m.store.Create(row)
+		}
+		if err != nil {
+			m.tf.err = err.Error()
+			return m, nil
+		}
+		if err := m.reloadTunnels(); err != nil {
+			m.tf.err = err.Error()
+			return m, nil
+		}
+		// Land the cursor on the tunnel that was just saved.
+		if i, ok := m.index[row.ID]; ok {
+			m.cursor = i
+		}
+		m.tf = nil
+		m.mode = modeList
+		m.storeErr = ""
+		m.layout()
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "esc":
+		m.tf = nil
+		m.mode = modeList
+		return m, nil
+	case "ctrl+c":
+		m.quitting = true
+		m.mgr.StopAll()
+		return m, tea.Quit
+	case "tab", "down":
+		return m, m.tf.move(1)
+	case "shift+tab", "up":
+		return m, m.tf.move(-1)
+	case "ctrl+s":
+		return save(m)
+	case " ":
+		if m.tf.focus == tfEnabled {
+			m.tf.enabled = !m.tf.enabled
+			return m, nil
+		}
+	case "enter":
+		// Enter walks the form and saves from the last field, matching the
+		// SSO wizard; ctrl+s saves from anywhere.
+		if m.tf.focus == tfEnabled {
+			return save(m)
+		}
+		return m, m.tf.move(1)
+	}
+
+	if m.tf.focus < tfInputCount {
+		var cmd tea.Cmd
+		m.tf.inputs[m.tf.focus], cmd = m.tf.inputs[m.tf.focus].Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m Model) updateTunnelDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "s", "enter":
+		if err := m.store.Delete(m.deleteTarget); err != nil {
+			m.storeErr = "no se pudo eliminar: " + err.Error()
+		} else if err := m.reloadTunnels(); err != nil {
+			m.storeErr = "no se pudo recargar: " + err.Error()
+		} else {
+			m.storeErr = ""
+		}
+		m.deleteTarget = ""
+		m.mode = modeList
+		m.layout()
+		return m, nil
+	case "n", "esc", "q":
+		m.deleteTarget = ""
+		m.mode = modeList
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) viewTunnelForm() string {
+	f := m.tf
+	title := "➕ Nuevo túnel"
+	if f.editing {
+		title = "✎ Editar túnel"
+	}
+
+	var b strings.Builder
+	b.WriteString(modalTitleStyle.Render(title))
+	b.WriteString("\n\n")
+
+	for i := 0; i < tfInputCount; i++ {
+		if f.editing && i == tfID {
+			// Shown for context, but fixed: it keys the row, the marks and
+			// the running process.
+			b.WriteString("  " + itemDimStyle.Render(labelPrompt(tunnelFormLabels[i])+f.inputs[i].Value()+"  (no editable)"))
+			b.WriteString("\n")
+			continue
+		}
+		b.WriteString("  " + f.inputs[i].View())
+		b.WriteString("\n")
+	}
+
+	check := "[ ]"
+	if f.enabled {
+		check = "[x]"
+	}
+	enabledLine := labelPrompt("activo") + check + " se muestra en la lista y reserva su puerto"
+	if f.focus == tfEnabled {
+		b.WriteString(cursorStyle.Render("▶ ") + selectedTitle.Render(enabledLine))
+	} else {
+		b.WriteString("  " + itemStyle.Render(enabledLine))
+	}
+	b.WriteString("\n\n")
+
+	if f.err != "" {
+		b.WriteString(modalErrStyle.Render("✗ " + f.err))
+	} else {
+		b.WriteString(modalHintStyle.Render("El comando aws ssm se arma solo con estos datos."))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(helpEntry("tab/↑↓", "cambiar campo") + "  " +
+		helpEntry("espacio", "activar/desactivar") + "  " +
+		helpEntry("ctrl+s", "guardar") + "  " +
+		helpEntry("esc", "cancelar"))
+
+	box := modalBoxStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m Model) viewTunnelDelete() string {
+	var b strings.Builder
+	b.WriteString(modalTitleStyle.Render("Eliminar túnel"))
+	b.WriteString("\n\n")
+
+	title := m.deleteTarget
+	if i, ok := m.index[m.deleteTarget]; ok {
+		title = m.services[i].cfg.Title
+	}
+	b.WriteString("Se va a borrar de la base de datos:\n\n")
+	b.WriteString("  " + selectedTitle.Render(title) + "\n")
+	b.WriteString("  " + itemDimStyle.Render("id: "+m.deleteTarget) + "\n\n")
+	b.WriteString(modalHintStyle.Render("No se puede deshacer. Para conservarlo sin que aparezca,\nedítalo con 'e' y desmárcalo como activo."))
+	b.WriteString("\n\n")
+	b.WriteString(helpEntry("s/y", "eliminar") + "  " + helpEntry("n/esc", "cancelar"))
 
 	box := modalBoxStyle.Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)

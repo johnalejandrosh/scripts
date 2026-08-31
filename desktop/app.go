@@ -14,6 +14,7 @@ import (
 	"scriptstui/internal/prefs"
 	"scriptstui/internal/procman"
 	"scriptstui/internal/ssologin"
+	"scriptstui/internal/store"
 )
 
 // App is the Wails-bound backend: a thin adapter over the same
@@ -24,11 +25,11 @@ type App struct {
 	ctx context.Context
 	mgr *procman.Manager
 
-	tpMu sync.RWMutex
-	// tunnelProfile maps service ID -> AWS CLI profile name. Loaded from the
-	// shared prefs file at startup and written back on every change, so an
-	// assignment survives restarts — and is the same one the terminal UI sees.
-	tunnelProfile map[string]string
+	// store is the shared tunnels database at the project root — the same file
+	// the terminal UI creates and edits, so both front ends list the same
+	// tunnels and see the same profile assignments. Tunnels are created,
+	// edited and deleted from the terminal UI; this one only reads them.
+	store *store.Store
 
 	npMu sync.Mutex
 	np   *pendingNewProfile // in-flight "new SSO profile" wizard, one at a time
@@ -46,12 +47,21 @@ type pendingNewProfile struct {
 	accessToken string
 }
 
-func NewApp() *App {
+func NewApp() (*App, error) {
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := st.Seed(config.Services(), prefs.LoadTunnelProfiles()); err != nil {
+		st.Close()
+		return nil, err
+	}
+
 	events := make(chan procman.Event, 4096)
 	return &App{
-		mgr:           procman.NewManager(events),
-		tunnelProfile: prefs.LoadTunnelProfiles(),
-	}
+		mgr:   procman.NewManager(events),
+		store: st,
+	}, nil
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -61,6 +71,9 @@ func (a *App) startup(ctx context.Context) {
 
 func (a *App) shutdown(ctx context.Context) {
 	a.mgr.StopAll()
+	if a.store != nil {
+		a.store.Close()
+	}
 }
 
 func (a *App) forwardTunnelEvents() {
@@ -82,9 +95,15 @@ func (a *App) forwardTunnelEvents() {
 // --- Tunnels ---------------------------------------------------------------
 
 type ServiceView struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Profile string `json:"profile"`
+	ID       string `json:"id"`
+	Proyecto string `json:"proyecto"`
+	Title    string `json:"title"`
+	Profile  string `json:"profile"`
+	// LocalPort is the port the tunnel listens on locally, and the connection
+	// strings are the ones stored alongside it for each OS.
+	LocalPort               int    `json:"localPort"`
+	ConnectionStringMac     string `json:"connectionStringMac"`
+	ConnectionStringWindows string `json:"connectionStringWindows"`
 	// Command is every step's full command line (one per line), with the
 	// assigned profile already spliced in, so the UI can show it and the user
 	// can copy it to run the tunnel by hand.
@@ -95,18 +114,21 @@ type ServiceView struct {
 // currently assigned to it. Live status/logs arrive separately over the
 // "tunnel:event" event as they happen.
 func (a *App) ListServices() []ServiceView {
-	a.tpMu.RLock()
-	defer a.tpMu.RUnlock()
-
-	svcs := config.Services()
-	out := make([]ServiceView, len(svcs))
-	for i, s := range svcs {
-		profile := a.tunnelProfile[s.ID]
+	rows, err := a.store.Enabled()
+	if err != nil {
+		return nil
+	}
+	out := make([]ServiceView, len(rows))
+	for i, r := range rows {
 		out[i] = ServiceView{
-			ID:      s.ID,
-			Title:   s.Title,
-			Profile: profile,
-			Command: commandLines(s, profile),
+			ID:                      r.ID,
+			Proyecto:                r.Proyecto,
+			Title:                   r.Title,
+			Profile:                 r.Profile,
+			LocalPort:               r.LocalPort,
+			ConnectionStringMac:     r.ConnStringMac,
+			ConnectionStringWindows: r.ConnStringWin,
+			Command:                 commandLines(r.Service(), r.Profile),
 		}
 	}
 	return out
@@ -116,14 +138,7 @@ func (a *App) ListServices() []ServiceView {
 // tunnel's steps should run as, and persists the choice. Takes effect on the
 // next start.
 func (a *App) AssignProfile(serviceID, profile string) error {
-	a.tpMu.Lock()
-	defer a.tpMu.Unlock()
-	if profile == "" {
-		delete(a.tunnelProfile, serviceID)
-	} else {
-		a.tunnelProfile[serviceID] = profile
-	}
-	return prefs.SaveTunnelProfiles(a.tunnelProfile)
+	return a.store.SetProfile(serviceID, profile)
 }
 
 // commandLines renders svc's steps as pasteable command lines, one per line,
@@ -154,20 +169,19 @@ func withProfile(svc config.Service, profile string) config.Service {
 // StartService launches serviceID's steps, using whatever profile is
 // currently assigned to it (falling back to ambient/pasted credentials).
 func (a *App) StartService(serviceID string) error {
-	for _, s := range config.Services() {
-		if s.ID != serviceID {
-			continue
-		}
-		a.tpMu.RLock()
-		profile := a.tunnelProfile[serviceID]
-		a.tpMu.RUnlock()
-		if profile != "" {
-			s = withProfile(s, profile)
-		}
-		a.mgr.Start(s)
-		return nil
+	row, err := a.store.Get(serviceID)
+	if err != nil {
+		return fmt.Errorf("túnel desconocido: %s", serviceID)
 	}
-	return fmt.Errorf("túnel desconocido: %s", serviceID)
+	if !row.Enabled {
+		return fmt.Errorf("el túnel %s está desactivado", serviceID)
+	}
+	svc := row.Service()
+	if row.Profile != "" {
+		svc = withProfile(svc, row.Profile)
+	}
+	a.mgr.Start(svc)
+	return nil
 }
 
 func (a *App) StopService(serviceID string) {

@@ -72,6 +72,11 @@ Atajos adicionales (ver también con `?`):
 | Tecla     | Acción                                                        |
 |-----------|-----------------------------------------------------------------|
 | `espacio` | Marcar varios túneles para iniciarlos/detenerlos juntos         |
+| `n`       | Crear un túnel nuevo                                             |
+| `e`       | Editar el túnel resaltado                                        |
+| `D`       | Eliminar el túnel resaltado (pide confirmación)                  |
+| `y`       | Copiar el comando `aws ssm` del túnel resaltado                  |
+| `C`       | Copiar la cadena de conexión del túnel resaltado                 |
 | `p`       | Abre un cuadro para elegir el perfil AWS del túnel resaltado (`↑`/`↓` + `enter`) |
 | `c`       | Pegar credenciales AWS manualmente (respaldo, ver abajo)         |
 | `pgup`/`pgdn` | Scroll de los logs                                           |
@@ -153,18 +158,80 @@ permisos restringidos de siempre.
 
 ## Agregar un túnel nuevo
 
-En `internal/config/config.go`, función `Services()`, agrega un `Service`
-con un `tunnelStep(label, target, region, parametersJSON, waitSeconds)`. No
-hace falta indicar ningún perfil ahí — se asigna desde la TUI con `p`.
+Desde la TUI, con `n`. No hay que tocar código ni recompilar: los túneles
+viven en una base SQLite (`scriptstui.db`, en la raíz del proyecto) y se
+administran desde la terminal.
+
+| Tecla | Acción                                            |
+|-------|---------------------------------------------------|
+| `n`   | Crear un túnel                                    |
+| `e`   | Editar el resaltado (el `id` no se puede cambiar) |
+| `D`   | Eliminarlo (pide confirmación)                    |
+
+Dentro del formulario: `tab`/`↑`/`↓` cambia de campo, `espacio` activa o
+desactiva el túnel, `ctrl+s` guarda y `esc` cancela.
+
+El comando `aws ssm start-session` no se escribe a mano: se arma solo con el
+target, el host y los puertos. Un túnel desactivado sigue guardado pero no
+aparece como arrancable y libera su puerto local.
+
+### La tabla `tunnels`
+
+```sql
+id                        -- 'db-balu', clave del túnel
+proyecto                  -- agrupador libre; la columna solo se muestra si se usa
+title                     -- nombre que sale en la lista
+target                    -- instancia EC2, 'i-074e88b2ee9d1d67f'
+host, remote_port         -- destino real (RDS, Redis, Redshift...)
+local_port                -- puerto local; único entre los túneles activos
+region, document_name     -- 'us-east-1' y el documento SSM
+profile                   -- nombre de un perfil de ~/.aws/config (se asigna con 'p')
+connection_string_mac     -- cadena de conexión lista para pegar, por SO
+connection_string_windows
+wait_seconds, enabled, sort_order, created_at, updated_at
+```
+
+### Copiar la cadena de conexión
+
+El panel derecho muestra, bajo el comando, la cadena de conexión guardada
+para el SO en curso (`connection_string_windows` en Windows,
+`connection_string_mac` en el resto). `C` la copia al portapapeles.
+
+Vale la pena la tecla: los dos paneles comparten cada fila de la pantalla,
+así que seleccionar con el mouse siempre arrastra también la lista de
+túneles. `y` hace lo mismo con el comando `aws ssm`.
+
+Las cadenas empiezan vacías — el panel muestra `sin definir` y `C` avisa en
+vez de copiar nada. Se llenan con `e`, en los campos `conn. string mac` y
+`conn. string win`.
+
+La base guarda **solo el nombre** del perfil AWS: los perfiles en sí siguen
+en `~/.aws/config`, que es de donde los lee el CLI de `aws`. Nunca se
+escriben credenciales ni tokens en `scriptstui.db`.
+
+Dos túneles activos no pueden compartir `local_port`: lo impide un índice
+único y el formulario lo avisa antes de guardar.
+
+En el primer arranque, si la base está vacía, se siembra con los túneles que
+están en `internal/config/config.go` y con los perfiles que hubiera en el
+antiguo `~/.config/scriptstui/tunnel-profiles.json`. Después de eso esa lista
+en Go ya no manda: manda la base.
+
+`scriptstui.db` está en `.gitignore` porque es un binario que conflictúa en
+cada edición. Para compartir su contenido: `sqlite3 scriptstui.db .dump`.
+Para usar otra ruta, `SCRIPTSTUI_DB=/otra/ruta.db`.
 
 ## Estructura
 
 ```
 main.go                      arranca la TUI (interfaz principal)
-internal/config/             definición de los túneles (sin credenciales)
+scriptstui.db                los túneles (SQLite, se crea en el primer arranque)
+internal/store/              la base de túneles: esquema, CRUD y siembra inicial
+internal/config/             tipos Service/Step y la siembra inicial de túneles
 internal/procman/            arranca/detiene los procesos, streamea logs
 internal/awscreds/           parseo/validación de credenciales pegadas
 internal/ssologin/           descubre perfiles, login/logout y alta de cuentas SSO
+internal/prefs/              lector del JSON viejo de perfiles (solo para migrar)
 internal/tui/                interfaz de terminal (bubbletea + lipgloss)
 desktop/                     app de escritorio (Wails) — mismo internal/, otra cara
 legacy-sh/                    scripts .sh originales, solo de referencia

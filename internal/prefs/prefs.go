@@ -1,8 +1,10 @@
-// Package prefs stores the small bits of state the user chooses in the UI and
-// expects to still be there next time: right now, which AWS CLI profile each
-// tunnel runs as. It lives in a plain JSON file the user can read or edit by
-// hand; nothing secret goes in it, only profile names that already exist in
-// ~/.aws/config.
+// Package prefs reads the JSON file that used to hold which AWS CLI profile
+// each tunnel runs as. That assignment now lives in the profile column of the
+// tunnels table (see internal/store), so this package is only the migration
+// path: it is read once, to carry the old choices into a fresh database, and
+// nothing writes to it any more. The file itself is left in place as a
+// backup, and never held anything secret — only profile names that already
+// exist in ~/.aws/config.
 package prefs
 
 import (
@@ -59,43 +61,4 @@ func LoadTunnelProfiles() map[string]string {
 		}
 	}
 	return out
-}
-
-// SaveTunnelProfiles persists the assignments, creating the directory if
-// needed. It writes to a temp file and renames, so an interrupted write can't
-// leave a half-written file behind.
-func SaveTunnelProfiles(assignments map[string]string) error {
-	path, err := Path()
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-
-	data, err := json.MarshalIndent(file{TunnelProfiles: assignments}, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-
-	tmp, err := os.CreateTemp(dir, fileName+".*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename below succeeds
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
 }

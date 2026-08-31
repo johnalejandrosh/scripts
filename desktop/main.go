@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"log"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -12,11 +13,15 @@ import (
 var assets embed.FS
 
 func main() {
-	// Create an instance of the app structure
-	app := NewApp()
+	// Create an instance of the app structure. This opens the shared tunnels
+	// database at the project root, so a failure here leaves nothing to show.
+	app, err := NewApp()
+	if err != nil {
+		log.Fatalln("Error:", err)
+	}
 
 	// Create application with options
-	err := wails.Run(&options.App{
+	err = wails.Run(&options.App{
 		Title:  "scriptstui-desktop",
 		Width:  1024,
 		Height: 768,
