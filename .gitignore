@@ -1,9 +1,0 @@
-/scriptstui
-
-# The tunnels database is per-install: it is created on first run from the
-# seed in internal/config, and then edited from the UI. A binary SQLite file
-# in git would conflict on every edit; use `sqlite3 scriptstui.db .dump` to
-# share its contents.
-/scriptstui.db
-/scriptstui.db-wal
-/scriptstui.db-shm
