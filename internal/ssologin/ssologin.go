@@ -172,11 +172,21 @@ func parseSSOProfiles(content string) []Profile {
 // line by line, on the returned channel, which is closed once the process
 // exits; the exit result then arrives on the second channel.
 func StreamCommand(ctx context.Context, name string, args ...string) (<-chan string, <-chan error) {
+	return streamCommand(ctx, nil, name, args...)
+}
+
+// streamCommand is StreamCommand with an optional environment, produced by
+// env. env is called from the worker goroutine, so a caller on the UI
+// thread never waits on whatever it takes to build (see browserEnv).
+func streamCommand(ctx context.Context, env func() []string, name string, args ...string) (<-chan string, <-chan error) {
 	lines := make(chan string, 256)
 	done := make(chan error, 1)
 
 	go func() {
 		cmd := exec.CommandContext(ctx, name, args...)
+		if env != nil {
+			cmd.Env = env()
+		}
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -218,9 +228,10 @@ func StreamCommand(ctx context.Context, name string, args ...string) (<-chan str
 
 // Login runs `aws sso login --profile profile`, which prints (and tries to
 // open in a browser) the verification URL/code and blocks until the user
-// approves it there.
+// approves it there. browserEnv points it at the browser the user was last
+// using rather than the system default one.
 func Login(ctx context.Context, profile string) (<-chan string, <-chan error) {
-	return StreamCommand(ctx, "aws", "sso", "login", "--profile", profile)
+	return streamCommand(ctx, browserEnv, "aws", "sso", "login", "--profile", profile)
 }
 
 // Logout runs `aws sso logout`. The AWS CLI has no per-profile logout: this
@@ -436,12 +447,6 @@ func StartDeviceAuthorization(ctx context.Context, region string, client OIDCCli
 		ExpiresIn:               resp.ExpiresIn,
 		IntervalSeconds:         interval,
 	}, nil
-}
-
-// OpenBrowser best-effort opens url in the default browser. Failures are
-// harmless: the caller should always also show the URL as text.
-func OpenBrowser(url string) {
-	_ = exec.Command("open", url).Start()
 }
 
 // PollForToken blocks — polling at the pace the device authorization asked
