@@ -6,12 +6,28 @@ export function AssignProfile(arg1, arg2) {
   return window['go']['main']['App']['AssignProfile'](arg1, arg2);
 }
 
+export function BackendWarning() {
+  return window['go']['main']['App']['BackendWarning']();
+}
+
 export function CancelNewSSOProfile() {
   return window['go']['main']['App']['CancelNewSSOProfile']();
 }
 
+export function CancelVerify() {
+  return window['go']['main']['App']['CancelVerify']();
+}
+
 export function FinishNewSSOProfile(arg1, arg2, arg3) {
   return window['go']['main']['App']['FinishNewSSOProfile'](arg1, arg2, arg3);
+}
+
+export function GetLogs(arg1) {
+  return window['go']['main']['App']['GetLogs'](arg1);
+}
+
+export function GetSSOSummary() {
+  return window['go']['main']['App']['GetSSOSummary']();
 }
 
 export function ListSSOProfiles() {
@@ -40,6 +56,10 @@ export function StartNewSSOProfile(arg1, arg2) {
 
 export function StartService(arg1) {
   return window['go']['main']['App']['StartService'](arg1);
+}
+
+export function StartVerify(arg1) {
+  return window['go']['main']['App']['StartVerify'](arg1);
 }
 
 export function StopService(arg1) {

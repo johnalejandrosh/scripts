@@ -5,9 +5,17 @@ import {ssologin} from '../models';
 
 export function AssignProfile(arg1:string,arg2:string):Promise<void>;
 
+export function BackendWarning():Promise<string>;
+
 export function CancelNewSSOProfile():Promise<void>;
 
+export function CancelVerify():Promise<void>;
+
 export function FinishNewSSOProfile(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function GetLogs(arg1:string):Promise<Array<string>>;
+
+export function GetSSOSummary():Promise<main.SSOSummary>;
 
 export function ListSSOProfiles():Promise<Array<main.SSOProfileView>>;
 
@@ -22,5 +30,7 @@ export function LogoutSSO():Promise<void>;
 export function StartNewSSOProfile(arg1:string,arg2:string):Promise<main.DeviceAuthView>;
 
 export function StartService(arg1:string):Promise<void>;
+
+export function StartVerify(arg1:boolean):Promise<main.VerifyUpdate>;
 
 export function StopService(arg1:string):Promise<void>;

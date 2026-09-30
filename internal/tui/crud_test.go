@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"scriptstui/internal/config"
 	"scriptstui/internal/procman"
@@ -298,19 +299,27 @@ func TestLogPanelAlignment(t *testing.T) {
 				m.cursor = cursor
 				m.layout()
 
+				view := m.View()
+				if h := lipgloss.Height(view); h > size.Height {
+					t.Fatalf("conn=%q %dx%d cursor=%d: la vista mide %d filas, más que la terminal",
+						conn, size.Width, size.Height, cursor, h)
+				}
+
+				// Bottom borders, top to bottom: the tunnel list, then the info
+				// panel and the log panel closing together, then the shortcuts.
 				var bottoms []string
-				for _, line := range strings.Split(m.View(), "\n") {
+				for _, line := range strings.Split(view, "\n") {
 					if strings.Contains(line, "╰") {
 						bottoms = append(bottoms, line)
 					}
 				}
-				if len(bottoms) != 1 {
-					t.Fatalf("conn=%q %dx%d cursor=%d: %d filas con borde inferior, esperaba 1",
-						conn, size.Width, size.Height, cursor, len(bottoms))
+				if len(bottoms) != 3 {
+					t.Fatalf("conn=%q %dx%d cursor=%d: %d filas con borde inferior, esperaba 3\n%s",
+						conn, size.Width, size.Height, cursor, len(bottoms), view)
 				}
-				if n := strings.Count(bottoms[0], "╰"); n != 2 {
-					t.Errorf("conn=%q %dx%d cursor=%d: los dos paneles no cierran en la misma fila (%d bordes)\n%s",
-						conn, size.Width, size.Height, cursor, n, bottoms[0])
+				if n := strings.Count(bottoms[1], "╰"); n != 2 {
+					t.Errorf("conn=%q %dx%d cursor=%d: la info y los logs no cierran en la misma fila (%d bordes)\n%s",
+						conn, size.Width, size.Height, cursor, n, bottoms[1])
 				}
 			}
 		}

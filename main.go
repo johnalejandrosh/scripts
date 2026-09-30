@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"scriptstui/internal/agent"
 	"scriptstui/internal/config"
 	"scriptstui/internal/prefs"
 	"scriptstui/internal/procman"
@@ -14,6 +16,11 @@ import (
 )
 
 func main() {
+	// The same binary is the shared agent both UIs spawn and talk to.
+	if len(os.Args) > 1 && os.Args[1] == agent.Arg {
+		os.Exit(agent.Main(os.Args[2:]))
+	}
+
 	dbPath := store.DefaultPath()
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -32,9 +39,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Se crearon %d túneles en %s\n", n, dbPath)
 	}
 
-	events := make(chan procman.Event, 4096)
-	mgr := procman.NewManager(events)
-	model, err := tui.NewModel(st, mgr)
+	// Tunnels live in the agent, so the desktop app sees and drives the same
+	// ones. Without it this UI still works, just on tunnels of its own.
+	var backend tui.Backend
+	if client, err := agent.Connect(dbPath); err == nil {
+		backend = client
+	} else {
+		fmt.Fprintln(os.Stderr, "aviso:", err, "— los túneles no se compartirán con la interfaz gráfica")
+		mgr := procman.NewManager(make(chan procman.Event, 4096))
+		mgr.StartHealthMonitor(context.Background())
+		backend = mgr
+	}
+	model, err := tui.NewModel(st, backend)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

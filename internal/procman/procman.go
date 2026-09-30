@@ -5,6 +5,7 @@ package procman
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -49,16 +50,36 @@ type EventKind int
 const (
 	EventLog EventKind = iota
 	EventStatus
+	// EventHealth reports a periodic check of a running tunnel: Healthy,
+	// RTT and Measured say how it went, Text why it failed.
+	EventHealth
+	// EventReload says the tunnels database changed under another front end
+	// and the list should be read again. ServiceID is empty.
+	EventReload
+	// EventBackendLost says the connection to the shared agent dropped;
+	// Text says why. ServiceID is empty.
+	EventBackendLost
+	// EventQuit says another front end quit everything: the tunnels are
+	// being stopped and this front end should close too.
+	EventQuit
 )
 
-// Event is sent for every log line produced by a step, and every time a
-// service's overall status changes.
+// Event is sent for every log line produced by a step, every time a
+// service's overall status changes, and for every health check.
 type Event struct {
 	ServiceID string
 	Kind      EventKind
 	Label     string
 	Text      string
 	Status    Status
+	// Since is when Status began (EventStatus), or which running session a
+	// health check was for (EventHealth). A front end that connects late
+	// uses it to show the real uptime instead of counting from zero.
+	Since time.Time
+
+	Healthy  bool
+	RTT      time.Duration
+	Measured bool
 }
 
 type runningService struct {
@@ -66,10 +87,26 @@ type runningService struct {
 	cfg      config.Service
 	cmds     []*exec.Cmd
 	stopping bool
+
+	// failed is set while the service sits in StatusFailed, waiting to be
+	// moved to StatusStopped on its own.
+	failed bool
+
+	// runningSince is when the service reached StatusRunning; zero until
+	// then and once it stops.
+	runningSince    time.Time
+	healthInFlight  bool
+	healthCheckedAt time.Time
 }
+
+// FailedResetDelay is how long a service stays in StatusFailed before it is
+// stopped on its own, so a failure is seen but doesn't linger in the list.
+const FailedResetDelay = 30 * time.Second
 
 type Manager struct {
 	events chan Event
+	// failedReset is FailedResetDelay; tests shorten it.
+	failedReset time.Duration
 
 	mu       sync.Mutex
 	services map[string]*runningService
@@ -80,8 +117,9 @@ type Manager struct {
 
 func NewManager(events chan Event) *Manager {
 	return &Manager{
-		events:   events,
-		services: make(map[string]*runningService),
+		events:      events,
+		failedReset: FailedResetDelay,
+		services:    make(map[string]*runningService),
 	}
 }
 
@@ -117,7 +155,11 @@ func (m *Manager) emitLog(id, label, text string) {
 }
 
 func (m *Manager) setStatus(id string, s Status) {
-	m.emit(Event{ServiceID: id, Kind: EventStatus, Status: s})
+	m.setStatusAt(id, s, time.Now())
+}
+
+func (m *Manager) setStatusAt(id string, s Status, at time.Time) {
+	m.emit(Event{ServiceID: id, Kind: EventStatus, Status: s, Since: at})
 }
 
 // Start launches every step of cfg in order, same semantics as the original
@@ -125,9 +167,9 @@ func (m *Manager) setStatus(id string, s Status) {
 // immediately before the next one starts.
 func (m *Manager) Start(cfg config.Service) {
 	m.mu.Lock()
-	if existing := m.services[cfg.ID]; existing != nil && !existing.stopping {
+	if existing := m.services[cfg.ID]; existing != nil {
 		existing.mu.Lock()
-		busy := len(existing.cmds) > 0
+		busy := !existing.stopping && len(existing.cmds) > 0
 		existing.mu.Unlock()
 		if busy {
 			m.mu.Unlock()
@@ -199,7 +241,11 @@ func (m *Manager) run(rs *runningService) {
 		go m.watchExit(rs, id, step.Label, exited)
 	}
 
-	m.setStatus(id, StatusRunning)
+	now := time.Now()
+	rs.mu.Lock()
+	rs.runningSince = now
+	rs.mu.Unlock()
+	m.setStatusAt(id, StatusRunning, now)
 }
 
 func (m *Manager) watchExit(rs *runningService, id, label string, exited <-chan error) {
@@ -221,8 +267,30 @@ func (m *Manager) watchExit(rs *runningService, id, label string, exited <-chan 
 }
 
 func (m *Manager) failAndStop(rs *runningService, id string) {
+	rs.mu.Lock()
+	rs.failed = true
+	rs.mu.Unlock()
 	m.setStatus(id, StatusFailed)
 	m.killAll(rs)
+	time.AfterFunc(m.failedReset, func() { m.resetFailed(rs, id) })
+}
+
+// resetFailed moves a service that is still in StatusFailed to StatusStopped.
+// Its processes are already gone; this only clears the state. A restart or a
+// manual stop in the meantime leaves it alone.
+func (m *Manager) resetFailed(rs *runningService, id string) {
+	m.mu.Lock()
+	current := m.services[id] == rs
+	m.mu.Unlock()
+	rs.mu.Lock()
+	due := current && rs.failed
+	rs.failed = false
+	rs.mu.Unlock()
+	if !due {
+		return
+	}
+	m.emitLog(id, "AUTO", fmt.Sprintf("detenido automáticamente tras %s en estado falló", m.failedReset.Round(time.Second)))
+	m.setStatus(id, StatusStopped)
 }
 
 // Stop terminates every process belonging to the service, if any.
@@ -233,6 +301,9 @@ func (m *Manager) Stop(id string) {
 	if rs == nil {
 		return
 	}
+	rs.mu.Lock()
+	rs.failed = false
+	rs.mu.Unlock()
 	m.setStatus(id, StatusStopping)
 	m.killAll(rs)
 	m.setStatus(id, StatusStopped)
@@ -261,9 +332,106 @@ func (m *Manager) StopAll() {
 	wg.Wait()
 }
 
+// Shutdown is what a front end calls on its way out. A Manager owns its
+// processes, so it stops them all.
+func (m *Manager) Shutdown() {
+	m.StopAll()
+}
+
+// QuitAll is a front end quitting everything. A Manager serves only that
+// front end, so it just stops its tunnels.
+func (m *Manager) QuitAll() {
+	m.StopAll()
+}
+
+// NotifyChanged tells other front ends that the tunnels database changed.
+// A Manager serves only the front end that holds it, so there is no one to
+// tell.
+func (m *Manager) NotifyChanged() {}
+
+// --- Health monitor ----------------------------------------------------------
+
+// A running tunnel only proves its session is alive; the monitor pushes a
+// connection through it every HealthInterval to prove the remote end still
+// answers, the same way a verification does.
+const (
+	HealthInterval = 45 * time.Second
+	// healthTickInterval is how often the monitor looks for tunnels due a
+	// check, which bounds how late the first one after a start can be.
+	healthTickInterval = 5 * time.Second
+	// healthWarmup gives a fresh session time to open its port before the
+	// first check, which would otherwise fail on a tunnel that is fine.
+	healthWarmup = 5 * time.Second
+)
+
+// StartHealthMonitor checks every running tunnel in the background until ctx
+// is done, reporting each result as an EventHealth.
+func (m *Manager) StartHealthMonitor(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(healthTickInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				m.checkHealth()
+			}
+		}
+	}()
+}
+
+func (m *Manager) checkHealth() {
+	m.mu.Lock()
+	all := make([]*runningService, 0, len(m.services))
+	for _, rs := range m.services {
+		all = append(all, rs)
+	}
+	m.mu.Unlock()
+
+	now := time.Now()
+	for _, rs := range all {
+		step, ok := tunnelStep(rs.cfg)
+		if !ok {
+			continue
+		}
+		rs.mu.Lock()
+		since := rs.runningSince
+		due := !since.IsZero() && !rs.stopping && !rs.healthInFlight &&
+			now.Sub(since) >= healthWarmup && now.Sub(rs.healthCheckedAt) >= HealthInterval
+		if due {
+			rs.healthInFlight = true
+		}
+		rs.mu.Unlock()
+		if due {
+			go m.healthCheck(rs, step, since)
+		}
+	}
+}
+
+func (m *Manager) healthCheck(rs *runningService, step config.Step, since time.Time) {
+	rtt, measured, err := CheckPortLatency(step.LocalPort, remotePort(step))
+
+	rs.mu.Lock()
+	rs.healthInFlight = false
+	rs.healthCheckedAt = time.Now()
+	current := rs.runningSince.Equal(since) && !rs.stopping
+	rs.mu.Unlock()
+	if !current {
+		return // the session it was for is gone
+	}
+
+	ev := Event{ServiceID: rs.cfg.ID, Kind: EventHealth, Since: since, Healthy: err == nil, RTT: rtt, Measured: measured}
+	if err != nil {
+		ev.Text = strings.SplitN(err.Error(), "\n", 2)[0]
+	}
+	m.emit(ev)
+}
+
 func (m *Manager) killAll(rs *runningService) {
 	rs.mu.Lock()
 	rs.stopping = true
+	rs.runningSince = time.Time{}
 	cmds := append([]*exec.Cmd(nil), rs.cmds...)
 	rs.mu.Unlock()
 

@@ -7,6 +7,24 @@ adaptador delgado sobre los mismos paquetes que usa la TUI
 interfaces comparten un solo backend y un solo estado real (`~/.aws/config`,
 `~/.aws/sso/cache`, los procesos de túnel).
 
+Los túneles viven en el **agente compartido** (`internal/agent`). Un túnel
+iniciado desde la terminal sale activo aquí, con su tiempo encendido y sus
+logs, y detenerlo aquí lo detiene también allá. Ver
+[Las dos interfaces comparten los túneles](../README.md#las-dos-interfaces-comparten-los-túneles).
+La vista de túneles tiene la misma distribución y funciones que la
+terminal:
+- **Verificar**, con botón o tecla `t`, en cola o en paralelo, con ayuda `?`;
+- estado con tiempo encendido y latencia;
+- vencimiento SSO, fecha y hora;
+- la onda de señal;
+- las marcas ✓/✗ de la última verificación.
+
+Crear, editar o eliminar túneles sigue siendo solo desde la terminal.
+
+Desde la terminal, `g` abre esta app. Si se abre desde Finder, la app toma
+el `PATH` de tu shell de login, así encuentra `aws` y
+`session-manager-plugin`.
+
 Este directorio **no tiene su propio `go.mod`** — es un subpaquete del
 módulo raíz (`scriptstui/desktop`) a propósito, porque `internal/...` solo es
 importable desde dentro del mismo módulo.

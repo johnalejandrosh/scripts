@@ -10,6 +10,7 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"scriptstui/internal/agent"
 	"scriptstui/internal/config"
 	"scriptstui/internal/prefs"
 	"scriptstui/internal/procman"
@@ -21,9 +22,32 @@ import (
 // internal/config, internal/procman and internal/ssologin packages the
 // terminal UI (internal/tui) uses, so both front ends share one source of
 // truth for tunnels and AWS SSO accounts.
+// backend runs the tunnels: the shared agent, so the terminal UI and this app
+// drive the same ones, or a procman.Manager of this app's own if the agent
+// can't be reached. It is the same contract internal/tui.Backend describes.
+type backend interface {
+	Start(cfg config.Service)
+	Stop(id string)
+	Probe(ctx context.Context, cfg config.Service) error
+	Events() <-chan procman.Event
+	NotifyChanged()
+	Shutdown()
+}
+
 type App struct {
 	ctx context.Context
-	mgr *procman.Manager
+	mgr backend
+	// backendWarning says why tunnels aren't shared, when they aren't.
+	backendWarning string
+
+	// tunnels mirrors what the backend reported, so the page can ask for the
+	// current state when it loads instead of relying on events it was not
+	// yet listening for.
+	tunnelsMu sync.Mutex
+	tunnels   map[string]*tunnelLive
+
+	verifyMu     sync.Mutex
+	verifyCancel context.CancelFunc
 
 	// store is the shared tunnels database at the project root — the same file
 	// the terminal UI creates and edits, so both front ends list the same
@@ -57,11 +81,16 @@ func NewApp() (*App, error) {
 		return nil, err
 	}
 
-	events := make(chan procman.Event, 4096)
-	return &App{
-		mgr:   procman.NewManager(events),
-		store: st,
-	}, nil
+	a := &App{store: st, tunnels: make(map[string]*tunnelLive)}
+	if client, err := agent.Connect(store.DefaultPath()); err == nil {
+		a.mgr = client
+	} else {
+		a.backendWarning = err.Error() + " — los túneles no se comparten con la terminal"
+		mgr := procman.NewManager(make(chan procman.Event, 4096))
+		mgr.StartHealthMonitor(context.Background())
+		a.mgr = mgr
+	}
+	return a, nil
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -70,7 +99,9 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
-	a.mgr.StopAll()
+	a.CancelVerify()
+	// Leaves the agent: tunnels stay up while the terminal UI is open.
+	a.mgr.Shutdown()
 	if a.store != nil {
 		a.store.Close()
 	}
@@ -78,18 +109,113 @@ func (a *App) shutdown(ctx context.Context) {
 
 func (a *App) forwardTunnelEvents() {
 	for ev := range a.mgr.Events() {
-		kind := "log"
-		if ev.Kind == procman.EventStatus {
-			kind = "status"
+		switch ev.Kind {
+		case procman.EventReload:
+			runtime.EventsEmit(a.ctx, "tunnels:changed")
+			continue
+		case procman.EventQuit:
+			// q / ctrl+c in the terminal UI quits everything, this window too.
+			runtime.Quit(a.ctx)
+			return
+		case procman.EventBackendLost:
+			runtime.EventsEmit(a.ctx, "backend:lost", ev.Text+" · reinicia la app")
+			return
 		}
-		runtime.EventsEmit(a.ctx, "tunnel:event", map[string]any{
-			"serviceId": ev.ServiceID,
-			"kind":      kind,
-			"label":     ev.Label,
-			"text":      ev.Text,
-			"status":    ev.Status.String(),
-		})
+		live := a.record(ev)
+		payload := map[string]any{"serviceId": ev.ServiceID, "live": live}
+		if ev.Kind == procman.EventLog {
+			payload["line"] = logLine(ev)
+		}
+		runtime.EventsEmit(a.ctx, "tunnel:event", payload)
 	}
+}
+
+// tunnelLive is a tunnel's live state as the page shows it.
+type tunnelLive struct {
+	Status string `json:"status"`
+	// Since is when the current status began (RFC3339), for the uptime.
+	Since string `json:"since"`
+	// Health is "", "ok" or "bad"; LatencyMs is set when it was measured.
+	Health    string `json:"health"`
+	LatencyMs int64  `json:"latencyMs"`
+	HealthErr string `json:"healthErr"`
+	// VerifiedAt/VerifiedOK are the last Verificar result.
+	VerifiedAt string `json:"verifiedAt"`
+	VerifiedOK bool   `json:"verifiedOk"`
+
+	logs     []string
+	sinceRaw time.Time
+}
+
+const maxLogLines = 500
+
+func logLine(ev procman.Event) string {
+	return "[" + ev.Label + "] " + ev.Text
+}
+
+// record folds one event into the mirror and returns the tunnel's state.
+func (a *App) record(ev procman.Event) tunnelLive {
+	a.tunnelsMu.Lock()
+	defer a.tunnelsMu.Unlock()
+	t := a.live(ev.ServiceID)
+	switch ev.Kind {
+	case procman.EventStatus:
+		t.Status = ev.Status.String()
+		t.sinceRaw = ev.Since
+		t.Since = ev.Since.Format(time.RFC3339)
+		t.Health, t.LatencyMs, t.HealthErr = "", 0, ""
+	case procman.EventHealth:
+		if !ev.Since.Equal(t.sinceRaw) {
+			break // a check of an earlier session
+		}
+		if ev.Healthy {
+			if t.Health == "bad" {
+				t.logs = append(t.logs, "[SALUD] responde de nuevo")
+			}
+			t.Health, t.HealthErr, t.LatencyMs = "ok", "", 0
+			if ev.Measured {
+				t.LatencyMs = ev.RTT.Milliseconds()
+			}
+		} else {
+			if t.Health != "bad" {
+				t.logs = append(t.logs, "[SALUD] sin respuesta: "+ev.Text)
+			}
+			t.Health, t.HealthErr, t.LatencyMs = "bad", ev.Text, 0
+		}
+	case procman.EventLog:
+		t.logs = append(t.logs, logLine(ev))
+	}
+	if len(t.logs) > maxLogLines {
+		t.logs = t.logs[len(t.logs)-maxLogLines:]
+	}
+	return *t
+}
+
+// live returns id's mirror entry, creating it; the caller holds tunnelsMu.
+func (a *App) live(id string) *tunnelLive {
+	t, ok := a.tunnels[id]
+	if !ok {
+		t = &tunnelLive{Status: procman.StatusStopped.String()}
+		a.tunnels[id] = t
+	}
+	return t
+}
+
+// GetLogs returns the tunnel's recent log lines, including the ones from
+// before this window opened.
+func (a *App) GetLogs(serviceID string) []string {
+	a.tunnelsMu.Lock()
+	defer a.tunnelsMu.Unlock()
+	if t, ok := a.tunnels[serviceID]; ok {
+		return append([]string(nil), t.logs...)
+	}
+	return nil
+}
+
+// BackendWarning is non-empty when tunnels aren't shared with the terminal
+// UI, saying why.
+func (a *App) BackendWarning() string {
+	return a.backendWarning
 }
 
 // --- Tunnels ---------------------------------------------------------------
@@ -108,6 +234,8 @@ type ServiceView struct {
 	// assigned profile already spliced in, so the UI can show it and the user
 	// can copy it to run the tunnel by hand.
 	Command string `json:"command"`
+	// Live is the tunnel's current state, whichever front end started it.
+	Live tunnelLive `json:"live"`
 }
 
 // ListServices returns every configured tunnel plus whatever AWS profile is
@@ -119,6 +247,8 @@ func (a *App) ListServices() []ServiceView {
 		return nil
 	}
 	out := make([]ServiceView, len(rows))
+	a.tunnelsMu.Lock()
+	defer a.tunnelsMu.Unlock()
 	for i, r := range rows {
 		out[i] = ServiceView{
 			ID:                      r.ID,
@@ -129,6 +259,7 @@ func (a *App) ListServices() []ServiceView {
 			ConnectionStringMac:     r.ConnStringMac,
 			ConnectionStringWindows: r.ConnStringWin,
 			Command:                 commandLines(r.Service(), r.Profile),
+			Live:                    *a.live(r.ID),
 		}
 	}
 	return out
@@ -138,7 +269,11 @@ func (a *App) ListServices() []ServiceView {
 // tunnel's steps should run as, and persists the choice. Takes effect on the
 // next start.
 func (a *App) AssignProfile(serviceID, profile string) error {
-	return a.store.SetProfile(serviceID, profile)
+	if err := a.store.SetProfile(serviceID, profile); err != nil {
+		return err
+	}
+	a.mgr.NotifyChanged()
+	return nil
 }
 
 // commandLines renders svc's steps as pasteable command lines, one per line,

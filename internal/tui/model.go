@@ -41,8 +41,9 @@ var ssoDeviceCodePattern = ssologin.DeviceCodePattern
 // each side plus one column of padding on each side.
 const logBoxChrome = 4
 
-// baseListWidth is the tunnel panel's width without the proyecto column.
-const baseListWidth = 74
+// baseListWidth is the tunnel panel's width without the proyecto column. It
+// leaves statusFieldWidth for the status, which carries uptime and latency.
+const baseListWidth = 84
 const titleFieldWidth = 34
 
 // projectColumnWidth is how much the panel grows once tunnels start carrying
@@ -86,6 +87,7 @@ const (
 	modeNewProfile
 	modeTunnelForm
 	modeTunnelDelete
+	modeVerify
 )
 
 var (
@@ -109,6 +111,18 @@ var (
 	listBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorAccent).
+			Padding(0, 1)
+
+	// infoBoxStyle frames the panel under the tunnel list (wave, clock).
+	infoBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#3A3A3A")).
+			Padding(0, 1)
+
+	// footerBoxStyle frames the shortcuts along the bottom.
+	footerBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#3A3A3A")).
 			Padding(0, 1)
 
 	logBoxStyle = lipgloss.NewStyle().
@@ -138,7 +152,31 @@ var (
 	modalTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 	modalHintStyle  = lipgloss.NewStyle().Foreground(colorMuted)
 	modalErrStyle   = lipgloss.NewStyle().Bold(true).Foreground(colorFailed)
+
+	// newBadgeStyle flags a shortcut that was just added, so it gets noticed
+	// in a footer people have stopped reading.
+	newBadgeStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#1A1A1A")).
+			Background(colorBusy).
+			Padding(0, 1)
 )
+
+// newBadge is the "NUEVO" tag shown next to a recently added shortcut.
+func newBadge() string {
+	return newBadgeStyle.Render("NUEVO")
+}
+
+// newFeatureEntry renders a footer shortcut as one shaded block, "key desc
+// NUEVO", so a newly added option stands out from the rest of the footer.
+// Terminals have no alpha, so the "see-through" yellow is colorBusy blended
+// at about a quarter over a dark background, with the text in full yellow.
+func newFeatureEntry(key, desc string) string {
+	style := lipgloss.NewStyle().Background(lipgloss.Color("#433717")).Foreground(colorBusy)
+	return style.Bold(true).Padding(0, 0, 0, 1).Render(key) +
+		style.Render(" "+desc+" ") +
+		style.Bold(true).Padding(0, 1, 0, 0).Render("NUEVO")
+}
 
 func statusColor(s procman.Status) lipgloss.Color {
 	switch s {
@@ -226,6 +264,17 @@ type serviceState struct {
 	status    procman.Status
 	logs      []string
 	startedAt time.Time
+	// statusSince is when the current status began, whatever it is.
+	statusSince time.Time
+
+	// What the health monitor last reported for this tunnel's session.
+	health       healthState
+	latency      time.Duration
+	latencyKnown bool
+
+	// The last Verificar result, shown on the list for verifyMarkTTL.
+	verifiedAt time.Time
+	verifiedOK bool
 }
 
 type tickMsg time.Time
@@ -506,8 +555,23 @@ func newCredsTextarea(totalWidth int) (textarea.Model, tea.Cmd) {
 	return ta, cmd
 }
 
+// Backend runs the tunnels. It is the shared agent (internal/agent) when one
+// is reachable, so this UI and the desktop app drive the same tunnels, or a
+// procman.Manager of this UI's own otherwise.
+type Backend interface {
+	Start(cfg config.Service)
+	Stop(id string)
+	SetAWSCredentials(env []string)
+	Probe(ctx context.Context, cfg config.Service) error
+	Events() <-chan procman.Event
+	// NotifyChanged tells the other front ends the tunnels database changed.
+	NotifyChanged()
+	// QuitAll is q/ctrl+c: stop every tunnel and close the desktop app too.
+	QuitAll()
+}
+
 type Model struct {
-	mgr      *procman.Manager
+	mgr      Backend
 	services []*serviceState
 	index    map[string]int
 	cursor   int
@@ -537,10 +601,15 @@ type Model struct {
 	// logPrefix is everything the log panel draws above the logs — header,
 	// command and connection line — already wrapped and trimmed to fit, so
 	// the view just prints it.
-	logPrefix  string
-	width      int
-	height     int
+	logPrefix string
+	width     int
+	height    int
+	// listHeight is the content height of the full-height panels: the logs
+	// on the main screen, and the panels of the SSO screen.
 	listHeight int
+	// tunnelsHeight is the tunnel list's content height, which shares the
+	// left column with the info panel below it.
+	tunnelsHeight int
 
 	mode          mode
 	credsInput    textarea.Model
@@ -580,15 +649,23 @@ type Model struct {
 	// deleteTarget is the id awaiting confirmation in modeTunnelDelete.
 	deleteTarget string
 
+	// verify is the check-every-tunnel run shown in modeVerify; nil when
+	// none has been started.
+	verify *verifyRun
+
 	showHelp    bool
 	showAllLogs bool
+
+	// frame advances on every animMsg; the spinner and the heartbeat read
+	// their position from it.
+	frame int
 
 	quitting bool
 }
 
 // NewModel builds the UI over st, reading the tunnel list from it. A failure
 // here is fatal for the caller: without the database there is nothing to show.
-func NewModel(st *store.Store, mgr *procman.Manager) (Model, error) {
+func NewModel(st *store.Store, mgr Backend) (Model, error) {
 	m := Model{
 		mgr:           mgr,
 		store:         st,
@@ -622,10 +699,13 @@ func (m *Model) reloadTunnels() error {
 	index := make(map[string]int, len(rows))
 	profiles := make(map[string]string, len(rows))
 	for i, r := range rows {
-		st := &serviceState{cfg: r.Service(), row: r, status: procman.StatusStopped}
+		st := &serviceState{status: procman.StatusStopped}
 		if prev, ok := previous[r.ID]; ok {
-			st.status, st.logs, st.startedAt = prev.status, prev.logs, prev.startedAt
+			// Everything the session and the UI learned carries over; only
+			// the definition comes fresh from the database.
+			*st = *prev
 		}
+		st.cfg, st.row = r.Service(), r
 		states[i] = st
 		index[r.ID] = i
 		if r.Profile != "" {
@@ -660,7 +740,7 @@ func waitForEvent(events <-chan procman.Event) tea.Cmd {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(waitForEvent(m.mgr.Events()), tick(), refreshSSOCmd())
+	return tea.Batch(waitForEvent(m.mgr.Events()), tick(), animTick(), ssoExpiryTick(), refreshSSOCmd())
 }
 
 // selected returns the highlighted tunnel, or nil when there are none left —
@@ -913,11 +993,11 @@ func wrapTokens(s string, width int) []string {
 }
 
 func (m *Model) layout() {
-	const headerHeight = 1
-	const footerHeight = 1
-	const borderHeight = 2 // top + bottom border, shared by both panels
+	const borderHeight = 2 // top + bottom border of every box
 
-	bodyHeight := m.height - headerHeight - footerHeight
+	// The shortcuts wrap onto a second row on a narrow terminal, so their box
+	// is measured rather than assumed.
+	bodyHeight := m.height - lipgloss.Height(m.footerBox())
 	if bodyHeight < 5 {
 		bodyHeight = 5
 	}
@@ -933,6 +1013,12 @@ func (m *Model) layout() {
 	}
 
 	m.listHeight = bodyHeight - borderHeight
+	// The left column stacks the tunnel list over the info panel and is as
+	// tall as the log panel beside it.
+	m.tunnelsHeight = m.listHeight - m.infoRows() - borderHeight
+	if m.tunnelsHeight < 1 {
+		m.tunnelsHeight = 1
+	}
 
 	// The command block sits between the log header and the logs. Its height
 	// depends on the selected tunnel and how far its line wraps, so measure it
@@ -1007,6 +1093,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tick()
 
+	case animMsg:
+		m.frame++
+		return m, animTick()
+
+	case ssoExpiryTickMsg:
+		return m, tea.Batch(readSSOExpiryCmd(m.discoveredProfiles), ssoExpiryTick())
+
+	case ssoExpiryMsg:
+		m.ssoExpiry = msg.expiry
+		return m, nil
+
 	case tea.KeyMsg:
 		switch m.mode {
 		case modeCredentials:
@@ -1021,6 +1118,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateTunnelForm(msg)
 		case modeTunnelDelete:
 			return m.updateTunnelDelete(msg)
+		case modeVerify:
+			return m.updateVerify(msg)
 		default:
 			return m.updateList(msg)
 		}
@@ -1239,7 +1338,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.marked = map[string]bool{}
 		return m, nil
 
+	case verifyResultMsg:
+		return m.handleVerifyResult(msg)
+
 	case procman.Event:
+		switch msg.Kind {
+		case procman.EventReload:
+			// Another front end changed the database.
+			if err := m.reloadTunnels(); err != nil {
+				m.storeErr = "no se pudo recargar: " + err.Error()
+			}
+			m.layout()
+			return m, waitForEvent(m.mgr.Events())
+		case procman.EventQuit:
+			// Only another front end can send it; this one has no quit-all
+			// of its own to receive, but closing is the right answer.
+			m.quitting = true
+			return m, tea.Quit
+		case procman.EventBackendLost:
+			m.storeErr = "✗ " + msg.Text + " · reinicia la app"
+			m.layout()
+			return m, nil // nothing more will arrive
+		}
 		i, ok := m.index[msg.ServiceID]
 		if !ok {
 			return m, waitForEvent(m.mgr.Events())
@@ -1256,10 +1376,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 			}
 		case procman.EventStatus:
-			s.status = msg.Status
-			if msg.Status == procman.StatusRunning {
-				s.startedAt = time.Now()
+			if s.status != msg.Status {
+				s.resetHealth()
 			}
+			s.status = msg.Status
+			s.statusSince = msg.Since
+			if msg.Status == procman.StatusRunning {
+				// Since is when it really started, which matters when this
+				// UI opened after another one started the tunnel.
+				s.startedAt = msg.Since
+				if s.startedAt.IsZero() {
+					s.startedAt = time.Now()
+				}
+			}
+		case procman.EventHealth:
+			m.applyHealth(i, msg)
 		}
 		return m, waitForEvent(m.mgr.Events())
 	}
@@ -1277,7 +1408,7 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quitting = true
-			m.mgr.StopAll()
+			m.mgr.QuitAll()
 			return m, tea.Quit
 		case "v", "esc":
 			m.showAllLogs = false
@@ -1288,11 +1419,18 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
 		m.quitting = true
-		m.mgr.StopAll()
+		m.mgr.QuitAll()
 		return m, tea.Quit
 	case "v":
 		m.showAllLogs = true
 		m.showHelp = false
+		return m, nil
+	case "t":
+		return m.startVerify()
+	case "g":
+		m.copyStatus = openDesktopApp()
+		m.copyStatusUntil = time.Now().Add(6 * time.Second)
+		m.layout()
 		return m, nil
 	case "up", "k":
 		if m.cursor > 0 {
@@ -1462,7 +1600,7 @@ func (m Model) updateSSO(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.ssoCancel()
 		}
 		m.quitting = true
-		m.mgr.StopAll()
+		m.mgr.QuitAll()
 		return m, tea.Quit
 	case "up", "k":
 		if m.ssoCursor > 0 {
@@ -1565,6 +1703,8 @@ func (m Model) updateAssignProfile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.storeErr = "no se pudo guardar el perfil: " + err.Error()
 		} else if err := m.reloadTunnels(); err != nil {
 			m.storeErr = "no se pudo recargar: " + err.Error()
+		} else {
+			m.mgr.NotifyChanged()
 		}
 		m.layout()
 		m.mode = modeList
@@ -1592,7 +1732,7 @@ func (m Model) updateNewProfile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.np.cancel()
 		}
 		m.quitting = true
-		m.mgr.StopAll()
+		m.mgr.QuitAll()
 		return m, tea.Quit
 	}
 
@@ -1725,7 +1865,7 @@ func (m Model) updateNewProfile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	if m.quitting {
-		return "Deteniendo servicios...\n"
+		return "Deteniendo todos los túneles y cerrando la interfaz gráfica...\n"
 	}
 	if !m.ready {
 		return "Cargando..."
@@ -1749,14 +1889,35 @@ func (m Model) View() string {
 		return m.viewTunnelForm()
 	case modeTunnelDelete:
 		return m.viewTunnelDelete()
+	case modeVerify:
+		return m.viewVerify()
 	default:
 		return m.viewList()
 	}
 }
 
-func (m Model) viewList() string {
-	header := titleStyle.Render("scriptstui — gestor de túneles")
+// footerBox is the row of shortcuts along the bottom of the main screen.
+func (m Model) footerBox() string {
+	help := helpEntry("enter/s", "iniciar") + "  " +
+		helpEntry("x", "detener") + "  " +
+		newFeatureEntry("t", "verificar") + "  " +
+		helpEntry("n", "nuevo") + "  " +
+		helpEntry("e", "editar") + "  " +
+		helpEntry("D", "eliminar") + "  " +
+		helpEntry("y", "comando") + "  " +
+		helpEntry("C", "conexión") + "  " +
+		helpEntry("a", "cuentas AWS") + "  " +
+		newFeatureEntry("g", "interfaz gráfica") + "  " +
+		helpEntry("?", "ayuda") + "  " +
+		helpEntry("q", "salir")
+	width := m.width - 4 // appStyle's padding plus this box's border
+	if width < 20 {
+		width = 20
+	}
+	return footerBoxStyle.Width(width).Render(help)
+}
 
+func (m Model) viewList() string {
 	projectWidth := m.projectFieldWidth()
 
 	var list strings.Builder
@@ -1766,7 +1927,10 @@ func (m Model) viewList() string {
 		list.WriteString("  " + helpEntry("n", "crear el primero"))
 		list.WriteString("\n")
 	}
-	for i, s := range m.services {
+	// Keep the highlighted tunnel on screen when the list outgrows its box.
+	start, end := visibleWindow(m.cursor, len(m.services), m.tunnelsHeight)
+	for i := start; i < end; i++ {
+		s := m.services[i]
 		cursorMark := "  "
 		titleStyleFor := itemStyle
 		if !s.row.Enabled {
@@ -1795,24 +1959,30 @@ func (m Model) viewList() string {
 
 		// A disabled tunnel can't be started, so it reports that instead of a
 		// run status that would never change.
-		statusText := s.status.String()
-		statusFg := statusColor(s.status)
+		statusText, statusFg := statusCell(s)
 		dot := statusDot(s.status)
-		if !s.row.Enabled {
+		switch {
+		case !s.row.Enabled:
 			statusText = "desactivado"
 			statusFg = colorStopped
 			dot = lipgloss.NewStyle().Foreground(colorStopped).Render("○")
 			portRendered = itemDimStyle.Render(padTrunc(portText, portFieldWidth))
-		} else if s.status == procman.StatusRunning && !s.startedAt.IsZero() {
-			statusText += " · " + time.Since(s.startedAt).Round(time.Second).String()
+		case s.status == procman.StatusStarting || s.status == procman.StatusStopping:
+			dot = m.spinner()
+		case s.status == procman.StatusRunning && s.health == healthBad:
+			dot = lipgloss.NewStyle().Foreground(colorBusy).Render("●")
 		}
-		statusRendered := lipgloss.NewStyle().Foreground(statusFg).Render(statusText)
+		statusRendered := lipgloss.NewStyle().Foreground(statusFg).Render(fitStatus(statusText))
 
-		line := cursorMark + selMark + " " + dot + " " + projectRendered + titleRendered + "  " + portRendered + " " + statusRendered
+		line := cursorMark + selMark + " " + dot + " " + projectRendered + titleRendered + "  " + portRendered + " " +
+			verifyMark(s) + " " + statusRendered
 		list.WriteString(line)
-		list.WriteString("\n")
+		if i < end-1 {
+			list.WriteString("\n")
+		}
 	}
-	listPanel := listBoxStyle.Width(m.listWidth()).Height(m.listHeight).Render(list.String())
+	listPanel := listBoxStyle.Width(m.listWidth()).Height(m.tunnelsHeight).Render(list.String())
+	left := lipgloss.JoinVertical(lipgloss.Left, listPanel, m.infoPanel(m.listWidth()))
 
 	logPanel := logBoxStyle.
 		Width(m.logPanelWidth).
@@ -1820,20 +1990,9 @@ func (m Model) viewList() string {
 		MaxHeight(m.listHeight + 2). // + top and bottom border
 		Render(m.logPrefix + "\n\n" + m.viewport.View())
 
-	body := lipgloss.JoinHorizontal(lipgloss.Top, listPanel, logPanel)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, left, logPanel)
 
-	help := helpEntry("enter/s", "iniciar") + "  " +
-		helpEntry("x", "detener") + "  " +
-		helpEntry("n", "nuevo") + "  " +
-		helpEntry("e", "editar") + "  " +
-		helpEntry("D", "eliminar") + "  " +
-		helpEntry("y", "comando") + "  " +
-		helpEntry("C", "conexión") + "  " +
-		helpEntry("a", "cuentas AWS") + "  " +
-		helpEntry("?", "ayuda") + "  " +
-		helpEntry("q", "salir")
-
-	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, header, body, help))
+	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, body, m.footerBox()))
 }
 
 // viewAllLogs shows every tunnel's log tail stacked full-width, for
@@ -1889,7 +2048,18 @@ func (m Model) viewHelp() string {
 	b.WriteString(helpEntry("y", "copiar al portapapeles el comando aws ssm del túnel resaltado") + "\n")
 	b.WriteString(helpEntry("C", "copiar la cadena de conexión del túnel resaltado (mac o windows según el SO)") + "\n")
 	b.WriteString(helpEntry("v", "ver los logs de los 3 túneles a la vez") + "\n")
+	b.WriteString(helpEntry("t", "verificar todos los túneles (en cola o en paralelo) y ver cuáles fallan") + " " + newBadge() + "\n")
 	b.WriteString(helpEntry("pgup/pgdn", "scroll de los logs") + "\n")
+	b.WriteString(helpEntry("g", "abrir la interfaz gráfica (comparte los mismos túneles)") + " " + newBadge() + "\n")
+
+	b.WriteString("\n")
+	b.WriteString(itemDimStyle.Render("Qué se ve en el panel principal"))
+	b.WriteString("\n")
+	b.WriteString(helpEntry("∿ onda", "se mueve si hay túneles activos; verde si todos responden, rojo con interferencia si alguno no") + "\n")
+	b.WriteString(helpEntry("activo · 12m · 43ms", "tiempo encendido y respuesta de la base (se revisa cada 45s)") + "\n")
+	b.WriteString(helpEntry("⠋", "el túnel está iniciando o deteniéndose") + "\n")
+	b.WriteString(helpEntry("✓/✗", "resultado de la última verificación (t); se apaga en 5 min") + "\n")
+	b.WriteString(helpEntry("SSO vence en", "la sesión AWS más próxima a vencer; ámbar <30 min, rojo <10 min") + "\n")
 
 	b.WriteString("\n")
 	b.WriteString(itemDimStyle.Render("Administrar túneles (se guardan en " + store.FileName + ")"))
@@ -2439,6 +2609,7 @@ func (m Model) updateTunnelForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.tf.err = err.Error()
 			return m, nil
 		}
+		m.mgr.NotifyChanged()
 		// Land the cursor on the tunnel that was just saved.
 		if i, ok := m.index[row.ID]; ok {
 			m.cursor = i
@@ -2457,7 +2628,7 @@ func (m Model) updateTunnelForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+c":
 		m.quitting = true
-		m.mgr.StopAll()
+		m.mgr.QuitAll()
 		return m, tea.Quit
 	case "tab", "down":
 		return m, m.tf.move(1)
@@ -2496,6 +2667,7 @@ func (m Model) updateTunnelDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.storeErr = "no se pudo recargar: " + err.Error()
 		} else {
 			m.storeErr = ""
+			m.mgr.NotifyChanged()
 		}
 		m.deleteTarget = ""
 		m.mode = modeList

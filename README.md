@@ -14,6 +14,28 @@ Tiene **dos interfaces**, ambas sobre la misma lógica en `internal/`
   nativa para quien prefiera no usar la terminal. Ver
   [desktop/README.md](desktop/README.md).
 
+### Las dos interfaces comparten los túneles
+
+La terminal y la app de escritorio no manejan túneles cada una por su lado.
+Los dos hablan con un mismo **agente**: un proceso en segundo plano que es
+el único dueño de los túneles.
+
+- Si inicias un túnel en una interfaz, sale **activo en la otra**, con el
+  mismo tiempo encendido y sus logs. Si lo detienes en cualquiera, se
+  detiene para las dos.
+- Crear, editar o eliminar un túnel, o cambiarle el perfil, se refleja al
+  instante en la otra interfaz.
+- El agente se inicia solo con la primera interfaz que abras; no hay que
+  hacer nada. Es el mismo binario con el argumento `agent`. Su salida queda
+  en `~/Library/Caches/scriptstui/agent.log`.
+- **`q` o `ctrl+c` en la terminal detiene todo:** todos los túneles, el
+  agente y también la app gráfica, si está abierta.
+- **Cerrar la ventana de la app gráfica no detiene nada** si la terminal
+  sigue abierta. Si la cerraste y no queda ninguna otra interfaz, los
+  túneles se detienen a los 5 s.
+- Si el agente no puede iniciarse, la interfaz funciona igual pero con
+  túneles propios, y avisa que no se comparten.
+
 ## Requisitos
 
 - Go 1.26+ (`go version`) — el módulo declara `go 1.26.5`
@@ -64,14 +86,16 @@ Solo 6 teclas visibles por defecto — el resto vive detrás de `?`:
 | `x`           | Detener el túnel resaltado                 |
 | `v`           | Ver los logs de los 3 túneles a la vez (en vez de solo el resaltado) |
 | `a`           | Abrir el panel de cuentas AWS SSO          |
+| `g`           | **Nuevo.** Abrir la interfaz gráfica (comparte los mismos túneles) |
 | `?`           | Ver todos los atajos (cierra con cualquier tecla) |
-| `q`           | Salir (detiene todo lo que esté corriendo) |
+| `q`           | Salir: detiene todos los túneles y cierra también la interfaz gráfica |
 
 Atajos adicionales (ver también con `?`):
 
 | Tecla     | Acción                                                        |
 |-----------|-----------------------------------------------------------------|
 | `espacio` | Marcar varios túneles para iniciarlos/detenerlos juntos         |
+| `t`       | **Nuevo.** Verificar todos los túneles (en cola o en paralelo) y mostrar cuáles fallaron la conexión (ver [Verificar túneles](#verificar-túneles)) |
 | `n`       | Crear un túnel nuevo                                             |
 | `e`       | Editar el túnel resaltado                                        |
 | `D`       | Eliminar el túnel resaltado (pide confirmación)                  |
@@ -86,6 +110,43 @@ apilados, uno por túnel, cada uno con su propio título/estado/perfil — para
 vigilar los tres a la vez sin tener que ir cambiando de selección. `v` o
 `esc` vuelve a la vista normal.
 
+### Qué muestra el panel principal
+
+- **Distribución.** Arriba a la izquierda está la lista de túneles y
+  debajo un recuadro de información. Los logs ocupan toda la altura a la
+  derecha y los atajos quedan en un recuadro abajo. Si la lista no cabe,
+  se desplaza con el cursor.
+- **Recuadro de información.** Tiene el título, una **onda de señal**
+  animada, cuántos túneles están activos, el aviso de vencimiento SSO y la
+  **fecha y hora**. La onda avanza mientras haya túneles activos y cambia
+  según su salud:
+  - verde y limpia si todos responden;
+  - ámbar si alguno está iniciando;
+  - roja y con interferencia si alguno no responde o falló.
+
+  Si no hay nada activo, es una línea plana gris. En terminales bajas se
+  dibuja con menos filas.
+- **Vencimiento SSO.** Muestra la sesión más próxima a vencer entre los
+  perfiles asignados a túneles activados. Se ve ámbar si faltan menos de
+  30 minutos y rojo si faltan menos de 10 o si ya venció. Lee la caché del
+  AWS CLI cada minuto, así que también detecta un login hecho desde otra
+  terminal.
+- **Spinner** (`⠋⠙⠹…`) en lugar del punto mientras un túnel inicia o se
+  detiene.
+- **Monitor de salud.** Cada 45 s, a cada túnel activo se le manda una
+  conexión, igual que al verificar. El estado muestra el tiempo encendido y
+  la latencia (`activo · 1h15m · 43ms`). La latencia solo se mide en
+  Postgres/Redshift, porque en otros puertos no hay nada que responda. Si
+  un túnel deja de contestar, pasa a ámbar con `sin respuesta`, y queda
+  una línea `[SALUD]` en sus logs.
+- **Túnel que falla.** Si un túnel falla al iniciar o se cae, sus procesos
+  se cierran y queda en `falló` con una cuenta atrás (`falló · se detiene
+  en 25s`). A los 30 s pasa solo a `detenido` y queda una línea `[AUTO]` en
+  sus logs. Si lo reinicias o lo detienes antes, la cuenta atrás se anula.
+- **Marca de verificación.** Después de `t`, cada túnel queda con `✓` o
+  `✗` junto al puerto. La marca se va apagando y desaparece a los 5
+  minutos.
+
 ### Panel de cuentas AWS SSO (`a`)
 
 | Tecla         | Acción                                              |
@@ -96,6 +157,35 @@ vigilar los tres a la vez sin tener que ir cambiando de selección. `v` o
 | `r`           | Refrescar la lista y el estado de login              |
 | `x`           | Cerrar sesión — **global**: `aws sso logout` cierra todas las cuentas a la vez, el AWS CLI no permite cerrar solo una |
 | `esc`/`a`     | Volver al panel principal                            |
+
+### Verificar túneles (`t`) — nuevo
+
+`t` prueba cada túnel activado y al final lista los que fallaron la
+conexión. En el pie de pantalla y en `?` está marcado como **NUEVO**.
+
+Al abrir el panel pregunta cómo probarlos (`↑`/`↓` + `enter`, o `1`/`2`):
+
+- **En cola (uno a uno)** — la opción por defecto.
+- **En paralelo** — más rápido, hasta 4 túneles a la vez. No hay choque de
+  puertos porque dos túneles activados nunca comparten puerto local; el tope
+  es para no disparar el límite de llamadas de AWS (`StartSession`, refresco
+  del token SSO), que se vería como fallos falsos.
+
+- **Túnel detenido**: lo abre un momento en su puerto local, manda una
+  conexión por él y lo vuelve a cerrar.
+- **Túnel ya activo**: prueba su puerto sin reiniciarlo.
+- En Postgres/Redshift (puerto remoto 5432/5439) exige que la base
+  responda. En otros puertos (Redis, etc.) basta con que el túnel no corte
+  la conexión.
+- Los túneles desactivados, o los que están iniciando/deteniéndose, se
+  omiten. Si el puerto local de un túnel detenido está ocupado por otro
+  proceso, ese túnel sale como fallido.
+- La salida de cada prueba queda en los logs del túnel con la etiqueta
+  `[VERIFICAR]`.
+
+Dentro del panel: `?` explica en palabras simples qué hace y qué hacer si
+un túnel falla, `esc` cancela o cierra, y `t` repite la verificación
+cuando termina.
 
 ## Credenciales AWS
 
@@ -228,7 +318,9 @@ main.go                      arranca la TUI (interfaz principal)
 scriptstui.db                los túneles (SQLite, se crea en el primer arranque)
 internal/store/              la base de túneles: esquema, CRUD y siembra inicial
 internal/config/             tipos Service/Step y la siembra inicial de túneles
-internal/procman/            arranca/detiene los procesos, streamea logs
+internal/procman/            arranca/detiene los procesos, streamea logs, verifica túneles
+internal/agent/              agente compartido: dueño de los túneles para ambas interfaces
+internal/shellenv/           PATH de la terminal para la app abierta desde Finder
 internal/awscreds/           parseo/validación de credenciales pegadas
 internal/ssologin/           descubre perfiles, login/logout y alta de cuentas SSO
 internal/prefs/              lector del JSON viejo de perfiles (solo para migrar)

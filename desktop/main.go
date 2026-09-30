@@ -3,16 +3,29 @@ package main
 import (
 	"embed"
 	"log"
+	"os"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+
+	"scriptstui/internal/agent"
+	"scriptstui/internal/shellenv"
 )
 
 //go:embed all:frontend/dist
 var assets embed.FS
 
 func main() {
+	// Opened from Finder the app gets launchd's bare PATH, where neither
+	// `aws` nor the session plugin is found.
+	shellenv.EnsurePATH()
+
+	// The same binary is the shared agent both UIs spawn and talk to.
+	if len(os.Args) > 1 && os.Args[1] == agent.Arg {
+		os.Exit(agent.Main(os.Args[2:]))
+	}
+
 	// Create an instance of the app structure. This opens the shared tunnels
 	// database at the project root, so a failure here leaves nothing to show.
 	app, err := NewApp()
