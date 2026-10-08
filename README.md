@@ -14,6 +14,18 @@ Tiene **dos interfaces**, ambas sobre la misma lógica en `internal/`
   nativa para quien prefiera no usar la terminal. Ver
   [desktop/README.md](desktop/README.md).
 
+## Inicio rápido
+
+1. Compila y abre la app: `go build -o scriptstui . && ./scriptstui`.
+2. Presiona `a` e inicia sesión (`enter`) en la cuenta AWS SSO del proyecto
+   que vas a usar.
+3. Vuelve con `esc`, elige un túnel con `↑`/`↓` y arráncalo con `enter`.
+4. Cuando diga `activo`, conéctate a `localhost:<puerto>` (el puerto sale
+   entre corchetes en la lista, ej. `[5435]`). `C` copia la cadena de
+   conexión.
+5. Si sale `falló`, mira los logs del panel derecho y busca el mensaje en
+   [Problemas frecuentes](#problemas-frecuentes).
+
 ### Las dos interfaces comparten los túneles
 
 La terminal y la app de escritorio no manejan túneles cada una por su lado.
@@ -84,7 +96,7 @@ Solo 6 teclas visibles por defecto — el resto vive detrás de `?`:
 | `↑`/`↓`       | Navegar la lista                           |
 | `enter` / `s` | Iniciar el túnel resaltado                 |
 | `x`           | Detener el túnel resaltado                 |
-| `v`           | Ver los logs de los 3 túneles a la vez (en vez de solo el resaltado) |
+| `v`           | Ver los logs de todos los túneles a la vez (en vez de solo el resaltado) |
 | `a`           | Abrir el panel de cuentas AWS SSO          |
 | `g`           | **Nuevo.** Abrir la interfaz gráfica (comparte los mismos túneles) |
 | `?`           | Ver todos los atajos (cierra con cualquier tecla) |
@@ -105,10 +117,10 @@ Atajos adicionales (ver también con `?`):
 | `c`       | Pegar credenciales AWS manualmente (respaldo, ver abajo)         |
 | `pgup`/`pgdn` | Scroll de los logs                                           |
 
-`v` (ver todos los logs) reemplaza la lista y el log único por 3 paneles
-apilados, uno por túnel, cada uno con su propio título/estado/perfil — para
-vigilar los tres a la vez sin tener que ir cambiando de selección. `v` o
-`esc` vuelve a la vista normal.
+`v` (ver todos los logs) reemplaza la lista y el log único por un panel
+apilado por túnel, cada uno con su propio título/estado/perfil, para
+vigilarlos todos a la vez sin ir cambiando de selección. Con muchos túneles
+cada panel muestra menos líneas. `v` o `esc` vuelve a la vista normal.
 
 ### Qué muestra el panel principal
 
@@ -310,6 +322,53 @@ en Go ya no manda: manda la base.
 `scriptstui.db` está en `.gitignore` porque es un binario que conflictúa en
 cada edición. Para compartir su contenido: `sqlite3 scriptstui.db .dump`.
 Para usar otra ruta, `SCRIPTSTUI_DB=/otra/ruta.db`.
+
+## Problemas frecuentes
+
+Cuando un túnel falla, el motivo está en sus logs (panel derecho, o `v`).
+Busca el mensaje de AWS y sigue la fila que corresponda:
+
+| Mensaje en los logs | Qué significa | Qué hacer |
+|---|---|---|
+| `The SSO session associated with this profile has expired` | La sesión SSO de ese perfil venció (duran unas horas). | `a` → selecciona la cuenta → `enter` para volver a iniciar sesión. Luego reinicia el túnel. |
+| `TargetNotConnected` | AWS no encuentra la instancia del túnel **con ese perfil**. Casi siempre el perfil es de otra cuenta; con menos frecuencia, el bastión está apagado. | Revisa que el perfil sea el de la cuenta donde vive la instancia (ver abajo) y cámbialo con `p`. |
+| `InvalidInstanceID.NotFound` | Igual que el anterior: la instancia no existe en la cuenta de ese perfil. | Ídem: corrige el perfil con `p`. |
+| `AccessDeniedException` | El rol del perfil no tiene permiso para esa acción o ese recurso. | Pide el rol correcto o usa otro perfil con acceso. |
+| Un túnel detenido sale fallido al verificar, sin error de AWS | Puede que otro proceso ocupe su puerto local. | Ciérralo (`lsof -i :<puerto>`) o cambia el `local_port` con `e`. |
+| `falló · se detiene en Ns` | No es un error en sí: es la cuenta atrás tras un fallo. | Lee la línea `[AWS]` de arriba para ver la causa real. |
+
+### ¿Cuál es el perfil correcto de un túnel?
+
+El ID de la instancia (`i-...`) **no dice a qué cuenta pertenece**, y
+proyectos como Balu tienen dos cuentas (PROD y NOPROD) con nombres de perfil
+parecidos. Es fácil asignar el perfil equivocado y que el túnel falle con
+`TargetNotConnected`.
+
+Para saber en qué cuenta está una instancia, pregúntale a cada perfil (con
+la sesión SSO iniciada en todos):
+
+```sh
+ID=i-05eaaec53625f5283   # el target del túnel
+for p in $(grep '^\[profile' ~/.aws/config | sed 's/\[profile //;s/\]//'); do
+  r=$(aws ssm describe-instance-information --region us-east-1 --profile "$p" \
+      --filters Key=InstanceIds,Values=$ID \
+      --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)
+  [ -n "$r" ] && [ "$r" != "None" ] && echo "$p → $r"
+done
+```
+
+- Si imprime `perfil → Online`, ese es el perfil que debe tener el túnel.
+- Si no imprime nada, revisa que tengas sesión en todos los perfiles. Un
+  perfil con la sesión vencida no aparece.
+- Algunos roles (por ejemplo `ssm_connect_permissions_CNE`) solo permiten
+  abrir la sesión, no listar instancias. Con esos el bucle no puede
+  confirmar nada y la única prueba es arrancar el túnel.
+
+Para ver qué perfil tiene cada túnel guardado en la base:
+
+```sh
+sqlite3 -header -column scriptstui.db "SELECT id, target, profile FROM tunnels;"
+```
 
 ## Estructura
 
