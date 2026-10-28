@@ -11,9 +11,13 @@ export function CancelNewSSOProfile():Promise<void>;
 
 export function CancelVerify():Promise<void>;
 
+export function CleanSSO():Promise<void>;
+
 export function FinishNewSSOProfile(arg1:string,arg2:string,arg3:string):Promise<string>;
 
 export function GetLogs(arg1:string):Promise<Array<string>>;
+
+export function GetSSOLoginGroups():Promise<main.SSOLoginGroups>;
 
 export function GetSSOSummary():Promise<main.SSOSummary>;
 

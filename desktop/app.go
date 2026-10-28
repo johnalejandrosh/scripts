@@ -379,6 +379,61 @@ func (a *App) LogoutSSO() {
 	go a.streamSSO(cancel, lines, done, "", "logout")
 }
 
+// SSOLoginGroups says how many separate logins the profiles need versus how
+// many portals they belong to; Groups > Portals is what CleanSSO fixes.
+type SSOLoginGroups struct {
+	Groups  int `json:"groups"`
+	Portals int `json:"portals"`
+}
+
+func (a *App) GetSSOLoginGroups() (SSOLoginGroups, error) {
+	profiles, err := ssologin.DiscoverProfiles()
+	if err != nil {
+		return SSOLoginGroups{}, err
+	}
+	groups, portals := ssologin.LoginGroups(profiles)
+	return SSOLoginGroups{Groups: groups, Portals: portals}, nil
+}
+
+// CleanSSO is the desktop's ":cleansso": it runs ssologin.CleanSSO, reports
+// the outcome as "sso:line" events and then logs in once, which covers every
+// profile of the portal. It always ends with "sso:done".
+func (a *App) CleanSSO() {
+	go func() {
+		emit := func(line string) {
+			runtime.EventsEmit(a.ctx, "sso:line", map[string]any{"profile": "", "action": "cleansso", "line": line})
+		}
+		r, err := ssologin.CleanSSO(context.Background())
+		if err != nil {
+			if r.Backup != "" {
+				emit("respaldo del config: " + r.Backup)
+			}
+			runtime.EventsEmit(a.ctx, "sso:done", map[string]any{"profile": "", "action": "cleansso", "error": err.Error()})
+			return
+		}
+		if r.LogoutWarning != "" {
+			emit("! aws sso logout: " + r.LogoutWarning)
+		}
+		emit(fmt.Sprintf("✓ %d perfiles unificados · %d sesiones viejas quitadas · %d archivos de cache borrados",
+			r.Profiles, len(r.Sessions), r.CacheRemoved))
+		emit("respaldo del config: " + r.Backup)
+		for _, url := range r.Portals {
+			emit("portal: " + url)
+		}
+		if len(r.Portals) > 1 {
+			emit(fmt.Sprintf("Tienes %d portales distintos: inicia sesión una vez en una cuenta de cada uno.", len(r.Portals)))
+		}
+		if r.LoginProfile == "" {
+			runtime.EventsEmit(a.ctx, "sso:done", map[string]any{"profile": "", "action": "cleansso", "error": ""})
+			return
+		}
+		emit("Iniciando sesión una sola vez con " + r.LoginProfile + "...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		lines, done := ssologin.Login(ctx, r.LoginProfile)
+		a.streamSSO(cancel, lines, done, r.LoginProfile, "login")
+	}()
+}
+
 func (a *App) streamSSO(cancel context.CancelFunc, lines <-chan string, done <-chan error, profile, action string) {
 	defer cancel()
 	pendingURL := ""

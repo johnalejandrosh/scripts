@@ -196,6 +196,11 @@ ese directorio está en `.gitignore`.
 - **Cuentas AWS SSO**: listar con estado y tiempo restante de sesión, login,
   logout global, y alta de cuenta nueva (mismo flujo de device
   authorization que la TUI).
+- **Arreglar inicios de sesión**: el botón *arreglar inicios de sesión* de la
+  vista Cuentas SSO hace lo mismo que `:cleansso` en la TUI (ver
+  [el README principal](../README.md#tengo-que-iniciar-sesión-varias-veces-cleansso)).
+  Antes de hacer nada explica qué va a pasar y pide confirmación. Si las
+  cuentas necesitan más de un login, el recuadro sale en ámbar con el aviso.
 - **No incluido**: pegar credenciales AWS a mano (`c` en la TUI) — es el
   respaldo manual para cuando no se usa SSO; si lo necesitas, por ahora usa
   la TUI.

@@ -25,6 +25,10 @@ const state = {
     ssoOutput: [],
     ssoRunning: false,
     ssoError: '',
+    // How many separate logins the profiles need vs. how many portals they
+    // belong to; more logins than portals is what "arreglar" fixes.
+    ssoGroups: { groups: 0, portals: 0 },
+    cleanConfirm: false,
 
     wizard: null, // {step:'form'|'waiting'|'accounts'|'roles', ...}
 };
@@ -94,6 +98,10 @@ function refreshProfiles() {
         state.ssoError = String(err);
         render();
     });
+    App.GetSSOLoginGroups().then((g) => {
+        state.ssoGroups = g;
+        render();
+    }).catch(() => {});
 }
 
 EventsOn('tunnel:event', (ev) => {
@@ -203,6 +211,14 @@ function logoutSSO() {
     state.ssoRunning = true;
     state.ssoOutput = ['cerrando todas las sesiones...'];
     App.LogoutSSO();
+    render();
+}
+
+function cleanSSO() {
+    state.cleanConfirm = false;
+    state.ssoRunning = true;
+    state.ssoOutput = ['Arreglando los inicios de sesión: cerrando sesión, ordenando ~/.aws/config y borrando sesiones viejas...'];
+    App.CleanSSO();
     render();
 }
 
@@ -597,6 +613,23 @@ function renderSSOView() {
         </div>
       </div>`).join('') || '<div class="empty">No hay cuentas SSO en ~/.aws/config todavía.</div>';
 
+    const { groups, portals } = state.ssoGroups;
+    const needsFix = groups > portals;
+    const fixCard = state.profiles.length === 0 ? '' : `
+      <div class="fix-card ${needsFix ? 'warn' : ''}">
+        <div class="fix-text">
+          ${needsFix
+              ? `<strong>⚠ Tus cuentas necesitan ${groups} inicios de sesión en vez de ${portals}.</strong>
+                 Algunas cuentas están guardadas de forma distinta y AWS las trata como si fueran de otro portal.`
+              : `<strong>¿Te toca iniciar sesión varias veces para que queden todas las cuentas logueadas?</strong>`}
+          Con este botón lo arreglas: queda un solo inicio de sesión para todas.
+        </div>
+        <button class="btn new-feature" id="btn-clean-sso" ${state.ssoRunning ? 'disabled' : ''}
+          title="Respalda ~/.aws/config, lo deja ordenado, borra las sesiones viejas y te pide iniciar sesión una sola vez">
+          arreglar inicios de sesión <span class="new-badge">NUEVO</span>
+        </button>
+      </div>`;
+
     return `
     <div class="panel list-panel">
       <div class="panel-header">
@@ -606,11 +639,36 @@ function renderSSOView() {
           <button class="btn" id="btn-logout-sso" ${state.ssoRunning ? 'disabled' : ''}>cerrar todas</button>
         </div>
       </div>
+      ${fixCard}
       ${rows}
     </div>
     <div class="panel log-panel">
       <div class="panel-header"><span>Salida de aws sso</span></div>
       <div class="log-body">${escapeHtml(state.ssoOutput.join('\n'))}${state.ssoRunning ? '<br><em>ejecutando...</em>' : ''}</div>
+    </div>`;
+}
+
+function renderCleanConfirm() {
+    if (!state.cleanConfirm) return '';
+    return `
+    <div class="modal-backdrop">
+      <div class="modal clean-modal">
+        <h2>Arreglar inicios de sesión</h2>
+        <p>Úsalo si tienes que iniciar sesión varias veces para que queden todas tus cuentas logueadas. Al terminar, con <strong>un solo</strong> inicio de sesión quedan todas.</p>
+        <h3>Qué va a pasar</h3>
+        <ol>
+          <li>Se cierran tus sesiones de AWS actuales.</li>
+          <li>Se guarda una copia de respaldo de tu configuración (<code>~/.aws/config.bak-…</code>).</li>
+          <li>Se ordena la configuración: todas las cuentas quedan guardadas de la misma forma.</li>
+          <li>Se borran las sesiones viejas guardadas en tu equipo.</li>
+          <li>Se abre el navegador para que inicies sesión <strong>una vez</strong>.</li>
+        </ol>
+        <p class="dim">Los túneles que ya están activos siguen funcionando. No se borra ninguna cuenta.</p>
+        <div class="modal-actions">
+          <button class="btn" id="clean-cancel">cancelar</button>
+          <button class="btn primary" id="clean-go">arreglar ahora</button>
+        </div>
+      </div>
     </div>`;
 }
 
@@ -704,6 +762,7 @@ function render() {
     </div>
     ${renderWizard()}
     ${renderVerify()}
+    ${renderCleanConfirm()}
   `;
     const newLogBody = document.getElementById('log-body');
     if (newLogBody && stickToBottom) newLogBody.scrollTop = newLogBody.scrollHeight;
@@ -755,6 +814,12 @@ function bindEvents() {
     });
     const logoutBtn = root.querySelector('#btn-logout-sso');
     if (logoutBtn) logoutBtn.addEventListener('click', logoutSSO);
+    const cleanBtn = root.querySelector('#btn-clean-sso');
+    if (cleanBtn) cleanBtn.addEventListener('click', () => { state.cleanConfirm = true; render(); });
+    const cleanCancel = root.querySelector('#clean-cancel');
+    if (cleanCancel) cleanCancel.addEventListener('click', () => { state.cleanConfirm = false; render(); });
+    const cleanGo = root.querySelector('#clean-go');
+    if (cleanGo) cleanGo.addEventListener('click', cleanSSO);
     const newBtn = root.querySelector('#btn-new-sso');
     if (newBtn) newBtn.addEventListener('click', openWizard);
 

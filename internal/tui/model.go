@@ -27,6 +27,7 @@ import (
 	"scriptstui/internal/procman"
 	"scriptstui/internal/ssologin"
 	"scriptstui/internal/store"
+	"scriptstui/internal/traffic"
 )
 
 const maxLogLines = 2000
@@ -54,6 +55,10 @@ const projectColumnWidth = 12
 // between a tunnel's title and its status, so the statuses stay aligned
 // whether or not a service has a port.
 const portFieldWidth = 7
+
+// trafficColumnWidth is the "↓1.2M/s ↑30K/s · 45M" column next to the port,
+// plus the space before it.
+const trafficColumnWidth = trafficFieldWidth + 1
 
 // maxImportWarnings caps how many per-account problems an import prints
 // before collapsing the rest into a count, so one broken account can't push
@@ -131,6 +136,9 @@ var (
 			Padding(0, 1)
 
 	logHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
+
+	// groupSeparatorStyle draws the faint line between projects in the list.
+	groupSeparatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#2E2E2E"))
 
 	cursorStyle   = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 	itemStyle     = lipgloss.NewStyle().Foreground(colorText)
@@ -221,10 +229,22 @@ func (m Model) projectFieldWidth() int {
 // listWidth is the tunnel panel's width, grown to fit the proyecto column
 // when it is in use.
 func (m Model) listWidth() int {
-	if w := m.projectFieldWidth(); w > 0 {
-		return baseListWidth + w + 1
+	w := baseListWidth + m.trafficFieldWidth()
+	if p := m.projectFieldWidth(); p > 0 {
+		w += p + 1
 	}
-	return baseListWidth
+	return w
+}
+
+// trafficFieldWidth is how much the panel grows for the traffic column; like
+// the proyecto column, it only takes room while some tunnel is running.
+func (m Model) trafficFieldWidth() int {
+	for _, s := range m.services {
+		if s.status == procman.StatusRunning {
+			return trafficColumnWidth
+		}
+	}
+	return 0
 }
 
 func helpEntry(key, desc string) string {
@@ -275,6 +295,10 @@ type serviceState struct {
 	// The last Verificar result, shown on the list for verifyMarkTTL.
 	verifiedAt time.Time
 	verifiedOK bool
+
+	// What the traffic sampler last measured on this tunnel's port.
+	traffic      traffic.Stats
+	trafficKnown bool
 }
 
 type tickMsg time.Time
@@ -377,6 +401,19 @@ func importAllProfilesCmd(region, startURL, token string) tea.Cmd {
 		defer cancel()
 		result, err := ssologin.ImportAllProfiles(ctx, region, startURL, token)
 		return ssoImportMsg{result: result, err: err}
+	}
+}
+
+// ssoCleanMsg carries the outcome of :cleansso.
+type ssoCleanMsg struct {
+	result ssologin.CleanResult
+	err    error
+}
+
+func cleanSSOCmd() tea.Cmd {
+	return func() tea.Msg {
+		result, err := ssologin.CleanSSO(context.Background())
+		return ssoCleanMsg{result: result, err: err}
 	}
 }
 
@@ -634,6 +671,11 @@ type Model struct {
 	ssoRefreshing      bool
 	ssoImporting       bool
 	ssoPendingURL      string
+	// ssoCmd is the ":" command being typed on the SSO screen (without the
+	// colon); ssoCmdActive is true while it's being typed.
+	ssoCmd       string
+	ssoCmdActive bool
+	ssoCleaning  bool
 
 	assignTarget string
 	assignCursor int
@@ -645,6 +687,10 @@ type Model struct {
 
 	np *newProfileWizard
 	tf *tunnelForm
+
+	// traffic turns nettop's counters into each tunnel's rate and total; it
+	// is a pointer so every copy of the model shares one history.
+	traffic *traffic.Sampler
 
 	// deleteTarget is the id awaiting confirmation in modeTunnelDelete.
 	deleteTarget string
@@ -674,6 +720,7 @@ func NewModel(st *store.Store, mgr Backend) (Model, error) {
 		tunnelProfile: make(map[string]string),
 		ssoStatus:     make(map[string]bool),
 		ssoExpiry:     make(map[string]time.Time),
+		traffic:       traffic.NewSampler(),
 	}
 	if err := m.reloadTunnels(); err != nil {
 		return Model{}, err
@@ -740,7 +787,7 @@ func waitForEvent(events <-chan procman.Event) tea.Cmd {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(waitForEvent(m.mgr.Events()), tick(), animTick(), ssoExpiryTick(), refreshSSOCmd())
+	return tea.Batch(waitForEvent(m.mgr.Events()), tick(), animTick(), ssoExpiryTick(), refreshSSOCmd(), trafficTick())
 }
 
 // selected returns the highlighted tunnel, or nil when there are none left —
@@ -1097,6 +1144,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.frame++
 		return m, animTick()
 
+	case trafficTickMsg:
+		return m, m.sampleTrafficCmd()
+
+	case trafficMsg:
+		m.applyTraffic(msg)
+		return m, trafficTick()
+
 	case ssoExpiryTickMsg:
 		return m, tea.Batch(readSSOExpiryCmd(m.discoveredProfiles), ssoExpiryTick())
 
@@ -1190,6 +1244,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ssoOutput = append(m.ssoOutput, "✓ listo")
 		}
 		return m, refreshSSOCmd()
+
+	case ssoCleanMsg:
+		m.ssoCleaning = false
+		r := msg.result
+		if msg.err != nil {
+			m.ssoOutput = append(m.ssoOutput, "✗ "+msg.err.Error())
+			if r.Backup != "" {
+				m.ssoOutput = append(m.ssoOutput, "  respaldo del config: "+r.Backup)
+			}
+			return m, refreshSSOCmd()
+		}
+		if r.LogoutWarning != "" {
+			m.ssoOutput = append(m.ssoOutput, "  ! aws sso logout: "+r.LogoutWarning)
+		}
+		m.ssoOutput = append(m.ssoOutput,
+			fmt.Sprintf("✓ %d perfiles unificados · %d sesiones viejas quitadas · %d archivos de cache borrados",
+				r.Profiles, len(r.Sessions), r.CacheRemoved),
+			"  respaldo del config: "+r.Backup,
+		)
+		for _, url := range r.Portals {
+			m.ssoOutput = append(m.ssoOutput, "  portal: "+url)
+		}
+		if len(r.Portals) > 1 {
+			m.ssoOutput = append(m.ssoOutput, fmt.Sprintf(
+				"Tienes %d portales distintos: inicia sesión (enter) una vez en un perfil de cada uno.", len(r.Portals)))
+		}
+		if r.LoginProfile == "" {
+			return m, refreshSSOCmd()
+		}
+		// One login now covers every profile of the portal.
+		m.ssoOutput = append(m.ssoOutput, "Iniciando sesión una sola vez con "+r.LoginProfile+"...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		lines, done := ssologin.Login(ctx, r.LoginProfile)
+		m.ssoCancel = cancel
+		m.ssoRunning = true
+		m.ssoAction = "login"
+		m.ssoActiveProfile = r.LoginProfile
+		m.ssoPendingURL = ""
+		m.ssoLines, m.ssoDone = lines, done
+		return m, tea.Batch(refreshSSOCmd(), waitSSOOutput(lines, done, r.LoginProfile, "login"))
 
 	case ssoImportMsg:
 		m.ssoImporting = false
@@ -1378,8 +1472,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case procman.EventStatus:
 			if s.status != msg.Status {
 				s.resetHealth()
+				s.trafficKnown = false
 			}
+			hadTraffic := m.trafficFieldWidth() > 0
 			s.status = msg.Status
+			if (m.trafficFieldWidth() > 0) != hadTraffic {
+				m.layout() // the traffic column appeared or went away
+			}
 			s.statusSince = msg.Since
 			if msg.Status == procman.StatusRunning {
 				// Since is when it really started, which matters when this
@@ -1591,7 +1690,14 @@ func (m Model) updateCredentials(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateSSO(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.ssoCmdActive {
+		return m.updateSSOCommand(msg)
+	}
 	switch msg.String() {
+	case ":":
+		m.ssoCmdActive = true
+		m.ssoCmd = ""
+		return m, nil
 	case "esc", "a":
 		m.mode = modeList
 		return m, nil
@@ -1672,6 +1778,51 @@ func (m Model) updateSSO(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, waitSSOOutput(lines, done, "", "logout")
 	}
 	return m, nil
+}
+
+// updateSSOCommand edits and runs the ":" command line of the SSO screen.
+func (m Model) updateSSOCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		m.ssoCmdActive = false
+		return m.updateSSO(msg)
+	case tea.KeyEsc:
+		m.ssoCmdActive = false
+		return m, nil
+	case tea.KeyBackspace:
+		if m.ssoCmd == "" {
+			m.ssoCmdActive = false
+			return m, nil
+		}
+		r := []rune(m.ssoCmd)
+		m.ssoCmd = string(r[:len(r)-1])
+		return m, nil
+	case tea.KeyRunes, tea.KeySpace:
+		m.ssoCmd += string(msg.Runes)
+		return m, nil
+	case tea.KeyEnter:
+	default:
+		return m, nil
+	}
+
+	m.ssoCmdActive = false
+	switch cmd := strings.TrimSpace(m.ssoCmd); cmd {
+	case "":
+		return m, nil
+	case "cleansso":
+		if m.ssoRunning || m.ssoImporting || m.ssoCleaning {
+			m.ssoOutput = append(m.ssoOutput, "✗ espera a que termine lo que está corriendo antes de :cleansso")
+			return m, nil
+		}
+		m.ssoCleaning = true
+		m.ssoOutput = []string{
+			"Limpiando SSO: cerrando sesión, unificando ~/.aws/config y borrando tokens viejos...",
+		}
+		return m, cleanSSOCmd()
+	default:
+		m.ssoOutput = append(m.ssoOutput, "✗ comando desconocido: :"+cmd+" (disponible: :cleansso)")
+		return m, nil
+	}
 }
 
 func (m Model) updateAssignProfile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1927,9 +2078,33 @@ func (m Model) viewList() string {
 		list.WriteString("  " + helpEntry("n", "crear el primero"))
 		list.WriteString("\n")
 	}
+	// The list is grouped by project (store.List orders it so) with a faint
+	// line between groups. rows holds a tunnel index per line, -1 for a
+	// separator, so the window below counts the separators as lines too.
+	var rows []int
+	cursorRow := 0
+	for i, s := range m.services {
+		if i > 0 && !strings.EqualFold(s.row.Proyecto, m.services[i-1].row.Proyecto) {
+			rows = append(rows, -1)
+		}
+		if i == m.cursor {
+			cursorRow = len(rows)
+		}
+		rows = append(rows, i)
+	}
+	separator := groupSeparatorStyle.Render("    " + strings.Repeat("─", max(m.listWidth()-8, 1)))
+
 	// Keep the highlighted tunnel on screen when the list outgrows its box.
-	start, end := visibleWindow(m.cursor, len(m.services), m.tunnelsHeight)
-	for i := start; i < end; i++ {
+	start, end := visibleWindow(cursorRow, len(rows), m.tunnelsHeight)
+	if start < end && rows[start] == -1 {
+		start++ // never open the box with a separator
+	}
+	for r := start; r < end; r++ {
+		i := rows[r]
+		if i == -1 {
+			list.WriteString(separator + "\n")
+			continue
+		}
 		s := m.services[i]
 		cursorMark := "  "
 		titleStyleFor := itemStyle
@@ -1956,6 +2131,10 @@ func (m Model) viewList() string {
 			portText = "[" + port + "]"
 		}
 		portRendered := portStyle.Render(padTrunc(portText, portFieldWidth))
+		trafficRendered := ""
+		if m.trafficFieldWidth() > 0 {
+			trafficRendered = trafficCell(s) + " "
+		}
 
 		// A disabled tunnel can't be started, so it reports that instead of a
 		// run status that would never change.
@@ -1975,9 +2154,9 @@ func (m Model) viewList() string {
 		statusRendered := lipgloss.NewStyle().Foreground(statusFg).Render(fitStatus(statusText))
 
 		line := cursorMark + selMark + " " + dot + " " + projectRendered + titleRendered + "  " + portRendered + " " +
-			verifyMark(s) + " " + statusRendered
+			trafficRendered + verifyMark(s) + " " + statusRendered
 		list.WriteString(line)
-		if i < end-1 {
+		if r < end-1 {
 			list.WriteString("\n")
 		}
 	}
@@ -2057,6 +2236,9 @@ func (m Model) viewHelp() string {
 	b.WriteString("\n")
 	b.WriteString(helpEntry("∿ onda", "se mueve si hay túneles activos; verde si todos responden, rojo con interferencia si alguno no") + "\n")
 	b.WriteString(helpEntry("activo · 12m · 43ms", "tiempo encendido y respuesta de la base (se revisa cada 45s)") + "\n")
+	b.WriteString(helpEntry("↓1.2M/s ↑32K/s · 46M", "al lado del puerto: lo que baja y sube por el túnel ahora mismo, y el total") + " " + newBadge() + "\n")
+	// Continuation line, indented under the description ("↓1.2M/s ↑32K/s · 46M " is 21 wide).
+	b.WriteString(helpStyle.Render("                     que lleva desde que se inició (se actualiza cada 2s)") + "\n")
 	b.WriteString(helpEntry("⠋", "el túnel está iniciando o deteniéndose") + "\n")
 	b.WriteString(helpEntry("✓/✗", "resultado de la última verificación (t); se apaga en 5 min") + "\n")
 	b.WriteString(helpEntry("SSO vence en", "la sesión AWS más próxima a vencer; ámbar <30 min, rojo <10 min") + "\n")
@@ -2076,6 +2258,10 @@ func (m Model) viewHelp() string {
 	b.WriteString(helpEntry("c", "pegar credenciales manualmente (respaldo)") + "\n")
 	b.WriteString(helpEntry("r", "recargar los perfiles de ~/.aws/config (en 'a' y en 'p')") + "\n")
 	b.WriteString(helpEntry("i", "en 'a': crear un perfil por cada cuenta y rol del portal") + "\n")
+	b.WriteString(helpEntry(":cleansso", "en 'a': escríbelo y enter si te toca iniciar sesión varias veces para") + " " + newBadge() + "\n")
+	// Continuation lines, indented under the description (":cleansso " is 10 wide).
+	b.WriteString(helpStyle.Render("          que queden todas las cuentas. Respalda ~/.aws/config, lo deja ordenado,") + "\n")
+	b.WriteString(helpStyle.Render("          borra las sesiones viejas y te pide iniciar sesión una sola vez") + "\n")
 
 	b.WriteString("\n")
 	b.WriteString(helpEntry("q", "salir") + "  " + helpEntry("(cualquier tecla)", "cerrar esta ayuda"))
@@ -2262,6 +2448,13 @@ func (m Model) viewSSO() string {
 		outLines = outLines[len(outLines)-room:]
 	}
 	outBody := strings.Join(outLines, "\n")
+	if outBody == "" && !m.ssoRunning && !m.ssoCleaning {
+		outBody = itemDimStyle.Render(
+			"¿Te toca iniciar sesión varias veces para que queden\n" +
+				"todas las cuentas logueadas? Escribe :cleansso y enter.\n" +
+				"Respalda ~/.aws/config, lo deja ordenado, borra las\n" +
+				"sesiones viejas y te pide iniciar sesión una sola vez.")
+	}
 	if m.ssoImporting {
 		if outBody != "" {
 			outBody += "\n"
@@ -2273,6 +2466,12 @@ func (m Model) viewSSO() string {
 			outBody += "\n"
 		}
 		outBody += modalHintStyle.Render("recargando perfiles...")
+	}
+	if m.ssoCleaning {
+		if outBody != "" {
+			outBody += "\n"
+		}
+		outBody += modalHintStyle.Render("limpiando configuración SSO...")
 	}
 	if m.ssoRunning {
 		if outBody != "" {
@@ -2290,7 +2489,19 @@ func (m Model) viewSSO() string {
 		helpEntry("n", "nuevo perfil") + "  " +
 		helpEntry("r", "refrescar") + "  " +
 		helpEntry("x", "cerrar sesión (todas)") + "  " +
+		helpEntry(":cleansso", "arreglar logins repetidos") + "  " +
 		helpEntry("esc/a", "volver")
+	if m.ssoCmdActive {
+		help = cursorStyle.Render(":"+m.ssoCmd+"█") + "  " +
+			helpEntry("enter", "ejecutar") + "  " + helpEntry("esc", "cancelar")
+	}
+
+	// Profiles of one portal should share a single login; more groups than
+	// portals means the config mixes formats or URL spellings.
+	if groups, portals := ssologin.LoginGroups(m.discoveredProfiles); groups > portals {
+		header += "  " + modalErrStyle.Render(fmt.Sprintf(
+			"⚠ tus perfiles necesitan %d logins distintos en vez de %d: escribe :cleansso", groups, portals))
+	}
 
 	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, header, body, help))
 }

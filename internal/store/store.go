@@ -211,10 +211,12 @@ const selectColumns = `
   document_name, profile, connection_string_mac, connection_string_windows,
   wait_seconds, enabled, sort_order`
 
-// List returns every tunnel, disabled ones included, in display order.
+// List returns every tunnel, disabled ones included, in display order:
+// grouped by project (those without one last), then by sort_order inside
+// each project.
 func (s *Store) List() ([]Tunnel, error) {
 	rows, err := s.db.Query(`SELECT` + selectColumns + `
-		FROM tunnels ORDER BY sort_order, proyecto, title, id`)
+		FROM tunnels ORDER BY proyecto = '', proyecto COLLATE NOCASE, sort_order, title, id`)
 	if err != nil {
 		return nil, fmt.Errorf("leyendo túneles: %w", err)
 	}

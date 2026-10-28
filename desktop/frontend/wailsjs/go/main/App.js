@@ -18,12 +18,20 @@ export function CancelVerify() {
   return window['go']['main']['App']['CancelVerify']();
 }
 
+export function CleanSSO() {
+  return window['go']['main']['App']['CleanSSO']();
+}
+
 export function FinishNewSSOProfile(arg1, arg2, arg3) {
   return window['go']['main']['App']['FinishNewSSOProfile'](arg1, arg2, arg3);
 }
 
 export function GetLogs(arg1) {
   return window['go']['main']['App']['GetLogs'](arg1);
+}
+
+export function GetSSOLoginGroups() {
+  return window['go']['main']['App']['GetSSOLoginGroups']();
 }
 
 export function GetSSOSummary() {

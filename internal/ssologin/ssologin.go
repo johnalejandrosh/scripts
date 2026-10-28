@@ -46,6 +46,10 @@ type Profile struct {
 	StartURL  string
 	SSORegion string
 	CLIRegion string
+	// Session is the [sso-session] the profile points at, or "" for the
+	// legacy flat format. It decides which token the profile shares: see
+	// LoginGroups.
+	Session string
 }
 
 func configPath() (string, error) {
@@ -144,10 +148,10 @@ func parseSSOProfiles(content string) []Profile {
 			continue
 		}
 
-		startURL, ssoRegion := s.kv["sso_start_url"], s.kv["sso_region"]
+		startURL, ssoRegion, session := s.kv["sso_start_url"], s.kv["sso_region"], ""
 		if sessionName, ok := s.kv["sso_session"]; ok {
 			if sess, ok := ssoSessions[sessionName]; ok {
-				startURL, ssoRegion = sess.kv["sso_start_url"], sess.kv["sso_region"]
+				startURL, ssoRegion, session = sess.kv["sso_start_url"], sess.kv["sso_region"], sessionName
 			}
 		}
 		if startURL == "" || ssoRegion == "" {
@@ -161,6 +165,7 @@ func parseSSOProfiles(content string) []Profile {
 			StartURL:  startURL,
 			SSORegion: ssoRegion,
 			CLIRegion: s.kv["region"],
+			Session:   session,
 		})
 	}
 
@@ -605,7 +610,7 @@ func WriteProfile(name, startURL, ssoRegion, accountID, roleName, cliRegion stri
 	}
 
 	block := header + "\n" +
-		"sso_start_url = " + startURL + "\n" +
+		"sso_start_url = " + NormalizeStartURL(startURL) + "\n" +
 		"sso_region = " + ssoRegion + "\n" +
 		"sso_account_id = " + accountID + "\n" +
 		"sso_role_name = " + roleName + "\n" +

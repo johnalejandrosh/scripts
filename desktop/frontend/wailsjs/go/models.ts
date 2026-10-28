@@ -16,6 +16,20 @@ export namespace main {
 	        this.verificationUriComplete = source["verificationUriComplete"];
 	    }
 	}
+	export class SSOLoginGroups {
+	    groups: number;
+	    portals: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new SSOLoginGroups(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.groups = source["groups"];
+	        this.portals = source["portals"];
+	    }
+	}
 	export class SSOProfileView {
 	    name: string;
 	    accountId: string;

@@ -151,6 +151,14 @@ cada panel muestra menos líneas. `v` o `esc` vuelve a la vista normal.
   Postgres/Redshift, porque en otros puertos no hay nada que responda. Si
   un túnel deja de contestar, pasa a ámbar con `sin respuesta`, y queda
   una línea `[SALUD]` en sus logs.
+- **Tráfico.** Al lado del puerto de cada túnel activo sale lo que está
+  bajando y subiendo **ahora mismo** y el total que lleva desde que se
+  inició: `↓1.2M/s ↑32K/s · 46M`. Se actualiza cada 2 s y se resalta en
+  cian mientras pasan datos. Es el tráfico real hacia AWS (lo mide `nettop`
+  sobre el proceso del túnel), así que incluye el cifrado y el protocolo de
+  SSM, no solo los datos de la consulta. No hay forma de medir la capacidad
+  máxima de un túnel SSM: lo que se ve es lo que se está usando. La columna
+  solo aparece mientras hay algún túnel activo.
 - **Túnel que falla.** Si un túnel falla al iniciar o se cae, sus procesos
   se cierran y queda en `falló` con una cuenta atrás (`falló · se detiene
   en 25s`). A los 30 s pasa solo a `detenido` y queda una línea `[AUTO]` en
@@ -168,7 +176,41 @@ cada panel muestra menos líneas. `v` o `esc` vuelve a la vista normal.
 | `n`           | Crear una cuenta nueva (asistente propio, ver abajo) |
 | `r`           | Refrescar la lista y el estado de login              |
 | `x`           | Cerrar sesión — **global**: `aws sso logout` cierra todas las cuentas a la vez, el AWS CLI no permite cerrar solo una |
+| `:cleansso`   | Reparar los logins: escribe `:cleansso` y `enter` (ver abajo) |
 | `esc`/`a`     | Volver al panel principal                            |
+
+#### Tengo que iniciar sesión varias veces: `:cleansso`
+
+Todas las cuentas de un mismo portal deberían quedar logueadas con **un solo**
+login. Si en un equipo hay que entrar 2 o 3 veces, es porque el AWS CLI ve el
+portal como varios distintos: guarda el token según el texto **exacto** de la
+configuración, así que estos casos cuentan como logins separados:
+
+- La misma URL escrita distinto: `.../start`, `.../start/`, `.../start/#`.
+- Perfiles en formato viejo (`sso_start_url` en el perfil) mezclados con
+  perfiles en formato nuevo (`sso_session` + bloque `[sso-session ...]`, el que
+  crea `aws configure sso`), o varios bloques `[sso-session]` con nombres
+  distintos.
+
+Cuando pasa, el título del panel lo avisa (`⚠ tus perfiles necesitan N logins
+distintos...`). Escribe `:cleansso` y `enter`, y la app:
+
+1. Cierra la sesión (`aws sso logout`).
+2. Guarda un respaldo en `~/.aws/config.bak-<fecha>`.
+3. Deja cada perfil SSO en un solo formato (el mismo que usa la app al crear
+   perfiles), con la URL sin `/` ni `#` al final, y quita los bloques
+   `[sso-session]` que ya nadie usa. Comentarios, regiones y perfiles que no
+   son SSO quedan igual.
+4. Borra los tokens y credenciales en cache (`~/.aws/sso/cache`,
+   `~/.aws/cli/cache`).
+5. Inicia sesión **una vez**, y con eso quedan todos los perfiles del portal.
+
+En la app de escritorio es el botón **arreglar inicios de sesión** de la
+vista Cuentas SSO; hace lo mismo, pero primero explica los pasos y pide
+confirmación.
+
+Los túneles que ya están corriendo siguen funcionando. Si algo sale mal,
+restaura el respaldo: `cp ~/.aws/config.bak-<fecha> ~/.aws/config`.
 
 ### Verificar túneles (`t`) — nuevo
 
@@ -335,6 +377,7 @@ Busca el mensaje de AWS y sigue la fila que corresponda:
 | `InvalidInstanceID.NotFound` | Igual que el anterior: la instancia no existe en la cuenta de ese perfil. | Ídem: corrige el perfil con `p`. |
 | `AccessDeniedException` | El rol del perfil no tiene permiso para esa acción o ese recurso. | Pide el rol correcto o usa otro perfil con acceso. |
 | Un túnel detenido sale fallido al verificar, sin error de AWS | Puede que otro proceso ocupe su puerto local. | Ciérralo (`lsof -i :<puerto>`) o cambia el `local_port` con `e`. |
+| Hay que iniciar sesión 2 o 3 veces para que queden todas las cuentas | El `~/.aws/config` mezcla formatos o escrituras de la URL del portal. | `a` → escribe `:cleansso` y `enter` (ver [arriba](#tengo-que-iniciar-sesión-varias-veces-cleansso)). |
 | `falló · se detiene en Ns` | No es un error en sí: es la cuenta atrás tras un fallo. | Lee la línea `[AWS]` de arriba para ver la causa real. |
 
 ### ¿Cuál es el perfil correcto de un túnel?

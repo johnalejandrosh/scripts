@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -12,6 +14,7 @@ import (
 
 	"scriptstui/internal/procman"
 	"scriptstui/internal/ssologin"
+	"scriptstui/internal/traffic"
 )
 
 // --- Animation clock -------------------------------------------------------
@@ -443,4 +446,84 @@ func fitStatus(s string) string {
 		return s
 	}
 	return padTrunc(s, statusFieldWidth)
+}
+
+// --- traffic: rate and total of each running tunnel ------------------------
+
+// trafficInterval is how often the running tunnels' traffic is sampled.
+const trafficInterval = 2 * time.Second
+
+// trafficFieldWidth fits "↓999K/s ↑999K/s · 999M".
+const trafficFieldWidth = 23
+
+type trafficTickMsg struct{}
+
+// trafficMsg carries one sample, keyed by service id. nil means nothing was
+// measured this time (no tunnel running, or nettop failed).
+type trafficMsg struct {
+	stats map[string]traffic.Stats
+}
+
+func trafficTick() tea.Cmd {
+	return tea.Tick(trafficInterval, func(time.Time) tea.Msg { return trafficTickMsg{} })
+}
+
+// sampleTrafficCmd measures every running tunnel's port. Only one sample is
+// in flight at a time: the next tick is scheduled once its result arrives.
+func (m Model) sampleTrafficCmd() tea.Cmd {
+	ports := make(map[int]string)
+	for _, s := range m.services {
+		if s.status != procman.StatusRunning {
+			continue
+		}
+		if port, err := strconv.Atoi(s.cfg.LocalPort()); err == nil {
+			ports[port] = s.cfg.ID
+		}
+	}
+	sampler := m.traffic
+	return func() tea.Msg {
+		if len(ports) == 0 || sampler == nil {
+			return trafficMsg{}
+		}
+		list := make([]int, 0, len(ports))
+		for port := range ports {
+			list = append(list, port)
+		}
+		byPort, err := sampler.Sample(context.Background(), list)
+		if err != nil {
+			return trafficMsg{}
+		}
+		stats := make(map[string]traffic.Stats, len(byPort))
+		for port, st := range byPort {
+			stats[ports[port]] = st
+		}
+		return trafficMsg{stats: stats}
+	}
+}
+
+func (m *Model) applyTraffic(msg trafficMsg) {
+	for _, s := range m.services {
+		st, ok := msg.stats[s.cfg.ID]
+		s.traffic, s.trafficKnown = st, ok
+	}
+}
+
+// trafficCell is the column next to the port: download and upload rate of
+// the tunnel right now, and everything it moved since it started. Blank for
+// a tunnel that isn't running.
+func trafficCell(s *serviceState) string {
+	if s.status != procman.StatusRunning || !s.trafficKnown {
+		return strings.Repeat(" ", trafficFieldWidth)
+	}
+	st := s.traffic
+	in, out := "…", "…"
+	if st.HasRate {
+		in, out = traffic.FormatBytes(st.RateIn)+"/s", traffic.FormatBytes(st.RateOut)+"/s"
+	}
+	text := fmt.Sprintf("↓%-6s ↑%-6s · %s", in, out, traffic.FormatBytes(float64(st.TotalIn+st.TotalOut)))
+	style := itemDimStyle
+	if st.HasRate && st.RateIn+st.RateOut >= 1000 {
+		style = portStyle // moving data right now: same color as the port
+	}
+	return style.Render(padTrunc(text, trafficFieldWidth))
 }
